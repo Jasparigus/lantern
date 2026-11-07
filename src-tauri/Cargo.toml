@@ -1,6 +1,6 @@
 [package]
 name = "lantern"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lantern — simple slideshow video maker for memorials and family gatherings"
 authors = ["jasparigus"]
 edition = "2024"
