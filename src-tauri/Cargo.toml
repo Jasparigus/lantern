@@ -2,7 +2,7 @@
 name = "lantern"
 version = "0.1.1"
 description = "Lantern — simple slideshow video maker for memorials and family gatherings"
-authors = ["jasparigus"]
+authors = ["Lantern contributors"]
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
