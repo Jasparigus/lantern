@@ -36,6 +36,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Add universal macOS Rust targets
+        if: startsWith(matrix.os, 'macos')
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Install Linux system libraries
         if: matrix.os == 'ubuntu-24.04'
         run: |
