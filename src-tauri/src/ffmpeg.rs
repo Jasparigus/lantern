@@ -37,7 +37,13 @@ fn tool_file_name(base: &str) -> String {
 }
 
 fn candidate_paths(base: &str, resource_dir: Option<&Path>) -> Vec<PathBuf> {
-    let name = tool_file_name(base);
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+    let mut names = vec![tool_file_name(base)];
+    // A universal macOS bundle ships one ffmpeg-universal-apple-darwin sidecar
+    // while the running process reports an aarch64 or x86_64 triple.
+    if cfg!(target_os = "macos") {
+        names.push(format!("{base}-universal-apple-darwin{exe}"));
+    }
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
@@ -51,7 +57,7 @@ fn candidate_paths(base: &str, resource_dir: Option<&Path>) -> Vec<PathBuf> {
         dirs.push(resource_dir.to_path_buf());
     }
     dirs.push(PathBuf::from("binaries"));
-    dirs.into_iter().map(|dir| dir.join(&name)).collect()
+    dirs.iter().flat_map(|dir| names.iter().map(|n| dir.join(n))).collect()
 }
 
 fn resolve_tool(base: &str, env_var: &str, resource_dir: Option<&Path>) -> PathBuf {

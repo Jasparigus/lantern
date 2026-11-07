@@ -53,9 +53,8 @@ jobs:
         run: |
           case "${{ matrix.os }}" in
             macos-latest)
-              # universal binary needs both architecture sidecars
-              ./scripts/prepare-sidecars.sh aarch64-apple-darwin
-              ./scripts/prepare-sidecars.sh x86_64-apple-darwin
+              # universal app: lipo-merged ffmpeg/ffprobe sidecars
+              ./scripts/prepare-sidecars.sh universal-apple-darwin
               ;;
             *)
               ./scripts/prepare-sidecars.sh

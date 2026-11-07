@@ -47,13 +47,32 @@ case "$TRIPLE" in
     ;;
   *-apple-darwin)
     case "$TRIPLE" in
-      aarch64*) ARCH=arm64 ;;
-      *)        ARCH=x64 ;;
+      aarch64*)
+        fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64"
+        install -m 0755 "$TMP/download" "$DEST/ffmpeg-$TRIPLE"
+        fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-arm64"
+        install -m 0755 "$TMP/download" "$DEST/ffprobe-$TRIPLE"
+        ;;
+      universal-apple-darwin)
+        fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64"
+        mv "$TMP/download" "$TMP/ffmpeg-arm64"
+        fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-x64"
+        mv "$TMP/download" "$TMP/ffmpeg-x64"
+        fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-arm64"
+        mv "$TMP/download" "$TMP/ffprobe-arm64"
+        fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-x64"
+        mv "$TMP/download" "$TMP/ffprobe-x64"
+        lipo -create "$TMP/ffmpeg-arm64" "$TMP/ffmpeg-x64" -output "$DEST/ffmpeg-$TRIPLE"
+        lipo -create "$TMP/ffprobe-arm64" "$TMP/ffprobe-x64" -output "$DEST/ffprobe-$TRIPLE"
+        chmod 0755 "$DEST/ffmpeg-$TRIPLE" "$DEST/ffprobe-$TRIPLE"
+        ;;
+      *)
+        fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-x64"
+        install -m 0755 "$TMP/download" "$DEST/ffmpeg-$TRIPLE"
+        fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-x64"
+        install -m 0755 "$TMP/download" "$DEST/ffprobe-$TRIPLE"
+        ;;
     esac
-    fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-$ARCH"
-    install -m 0755 "$TMP/download" "$DEST/ffmpeg-$TRIPLE"
-    fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-$ARCH"
-    install -m 0755 "$TMP/download" "$DEST/ffprobe-$TRIPLE"
     ;;
   *)
     echo "unsupported target triple: $TRIPLE" >&2
