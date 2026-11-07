@@ -62,9 +62,16 @@ case "$TRIPLE" in
         mv "$TMP/download" "$TMP/ffprobe-arm64"
         fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-x64"
         mv "$TMP/download" "$TMP/ffprobe-x64"
-        lipo -create "$TMP/ffmpeg-arm64" "$TMP/ffmpeg-x64" -output "$DEST/ffmpeg-$TRIPLE"
-        lipo -create "$TMP/ffprobe-arm64" "$TMP/ffprobe-x64" -output "$DEST/ffprobe-$TRIPLE"
-        chmod 0755 "$DEST/ffmpeg-$TRIPLE" "$DEST/ffprobe-$TRIPLE"
+        # per-arch names: the universal build compiles aarch64/x86_64 stages first,
+        # each stage validates the sidecar against its own triple
+        install -m 0755 "$TMP/ffmpeg-arm64" "$DEST/ffmpeg-aarch64-apple-darwin"
+        install -m 0755 "$TMP/ffmpeg-x64" "$DEST/ffmpeg-x86_64-apple-darwin"
+        install -m 0755 "$TMP/ffprobe-arm64" "$DEST/ffprobe-aarch64-apple-darwin"
+        install -m 0755 "$TMP/ffprobe-x64" "$DEST/ffprobe-x86_64-apple-darwin"
+        # bundle stage: single fat binary named for the universal target
+        lipo -create "$TMP/ffmpeg-arm64" "$TMP/ffmpeg-x64" -output "$DEST/ffmpeg-universal-apple-darwin"
+        lipo -create "$TMP/ffprobe-arm64" "$TMP/ffprobe-x64" -output "$DEST/ffprobe-universal-apple-darwin"
+        chmod 0755 "$DEST/ffmpeg-universal-apple-darwin" "$DEST/ffprobe-universal-apple-darwin"
         ;;
       *)
         fetch "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-x64"
