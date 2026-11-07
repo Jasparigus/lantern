@@ -68,11 +68,13 @@ each target on its native OS, which is the only reliable way to produce
 them:
 
 - **Linux:** AppImage + `.deb` + `.rpm` (Ubuntu 24.04 runner)
-- **macOS:** universal (Apple silicon + Intel) `.dmg` (macOS-14 runner)
+- **macOS:** universal (Apple silicon + Intel) `.dmg` (macOS runner)
 - **Windows:** NSIS `.exe` + `.msi` (Windows runner)
 
+Released installers: <https://github.com/Jasparigus/lantern/releases>
+
 Trigger it from the Actions tab ("Release builds" → *Run workflow*) or by
-pushing a version tag (`git tag v0.1.0 && git push --tags`), which also
+pushing a version tag (`git tag v0.1.3 && git push --tags`), which also
 publishes the installers to the GitHub Release.
 
 Local build for development (current OS only):
