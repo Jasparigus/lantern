@@ -61,13 +61,9 @@ pub fn escape_concat_path(path: &Path) -> String {
 }
 
 /// Bump when segment encoding semantics change so old cache entries are not reused.
-const SEGMENT_PIPELINE: &str = "segs-v2-tv-range";
+const SEGMENT_PIPELINE: &str = "segs-v3-transition-windows";
 
-/// Cache key for one normalized segment: everything that changes the encoded
-/// result — the pipeline version, the asset file itself (size+mtime), the frame
-/// spec, and the item choices. Reordering or re-exporting reuses every segment
-/// that still hashes the same.
-fn segment_hash(media: &Path, spec: &EncodeSpec, kind: &str, duration: f64, trim_start: f64) -> String {
+fn hash_media_identity(hasher: &mut Sha256, media: &Path) {
     let meta = std::fs::metadata(media).ok();
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mtime = meta
@@ -76,13 +72,34 @@ fn segment_hash(media: &Path, spec: &EncodeSpec, kind: &str, duration: f64, trim
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut hasher = Sha256::new();
-    hasher.update(SEGMENT_PIPELINE.as_bytes());
     hasher.update(media.as_os_str().to_string_lossy().as_bytes());
     hasher.update(size.to_le_bytes());
     hasher.update(mtime.to_le_bytes());
+}
+
+fn hex_digest(hasher: Sha256) -> String {
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Cache key for one normalized segment: everything that changes the encoded
+/// result — the pipeline version, the asset file itself (size+mtime), the frame
+/// spec, and the item choices including the transition content window.
+/// Reordering or re-exporting reuses every segment that still hashes the same.
+fn segment_hash(
+    media: &Path,
+    spec: &EncodeSpec,
+    kind: &str,
+    duration: f64,
+    trim_start: f64,
+    window_start: f64,
+    window_len: f64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SEGMENT_PIPELINE.as_bytes());
+    hash_media_identity(&mut hasher, media);
     hasher.update(format!(
-        "{}x{}@{} crf{} {} {} {} {} dur{} trim{}",
+        "{}x{}@{} crf{} {} {} {} {} {} dur{} trim{} win{}+{}",
         spec.width,
         spec.height,
         spec.fps,
@@ -90,12 +107,89 @@ fn segment_hash(media: &Path, spec: &EncodeSpec, kind: &str, duration: f64, trim
         spec.preset,
         serde_json::to_string(&spec.fit).unwrap_or_default(),
         serde_json::to_string(&spec.background).unwrap_or_default(),
+        spec.kenburns,
         kind,
         (duration * 1000.0).round() as i64,
         (trim_start * 1000.0).round() as i64,
+        (window_start * 1000.0).round() as i64,
+        (window_len * 1000.0).round() as i64,
     ));
-    let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    hex_digest(hasher)
+}
+
+/// Cache key for one pair blend segment: both media identities, the transition
+/// name and length, both content windows, and the frame spec (the encoder flags
+/// and normalization fits that go into the render). Order matters — a→b differs
+/// from b→a.
+fn transition_hash(
+    a_media: &Path,
+    b_media: &Path,
+    spec: &EncodeSpec,
+    transition: &str,
+    x: f64,
+    a_window_start: f64,
+    b_window_start: f64,
+    a_fit: crate::project::Fit,
+    b_fit: crate::project::Fit,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SEGMENT_PIPELINE.as_bytes());
+    hasher.update(b"blend");
+    hash_media_identity(&mut hasher, a_media);
+    hash_media_identity(&mut hasher, b_media);
+    hasher.update(format!(
+        "{}x{}@{} crf{} {} bg{} transition {} fits {} {} x{} awin{} bwin{}",
+        spec.width,
+        spec.height,
+        spec.fps,
+        spec.crf,
+        spec.preset,
+        serde_json::to_string(&spec.background).unwrap_or_default(),
+        transition,
+        serde_json::to_string(&a_fit).unwrap_or_default(),
+        serde_json::to_string(&b_fit).unwrap_or_default(),
+        (x * 1000.0).round() as i64,
+        (a_window_start * 1000.0).round() as i64,
+        (b_window_start * 1000.0).round() as i64,
+    ));
+    hex_digest(hasher)
+}
+
+/// Effective blend length (shared contract with the frontend): zero for
+/// "none"/"kenburns" or single-item shows; otherwise capped by the shortest
+/// item so every content window keeps at least 0.3 s of solo screen time,
+/// and abandoned entirely below 0.2 s.
+pub fn blend_length(transition: &str, durations: &[f64]) -> f64 {
+    let transition = crate::project::normalize_transition(transition);
+    if transition == "none" || transition == "kenburns" || durations.len() < 2 {
+        return 0.0;
+    }
+    let min_dur = durations.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut x = if durations.len() == 2 {
+        ffmpeg::TRANSITION_SECONDS.min(min_dur - 0.3)
+    } else {
+        ffmpeg::TRANSITION_SECONDS.min((min_dur - 0.3) / 2.0)
+    };
+    if x < 0.2 {
+        x = 0.0;
+    }
+    x
+}
+
+/// Content window of one item under an x-second overlap: the first item loses
+/// its tail, the last its head, middle items both. Returns (offset from
+/// trim_start, window length). x = 0 keeps the full window.
+pub fn content_window(index: usize, count: usize, duration: f64, x: f64) -> (f64, f64) {
+    if x <= 0.0 || count < 2 {
+        return (0.0, duration);
+    }
+    if index == 0 {
+        (0.0, duration - x)
+    } else if index == count - 1 {
+        (x, duration - x)
+    } else {
+        (x, duration - 2.0 * x)
+    }
 }
 
 async fn run_ffmpeg_stage(
@@ -194,10 +288,22 @@ pub async fn export_project(
     on_progress: &mut (dyn FnMut(&ProgressEvent) + Send),
 ) -> Result<ExportSummary, String> {
     let plan = timeline::plan(ctx)?;
-    let total = plan.total_duration;
     if plan.items.is_empty() {
         return Err("Add some photos before creating the video.".to_string());
     }
+
+    // Transitions apply to the whole show: the overlap x shrinks the timeline
+    // (total = Σ durations − (n−1)·x) and shifts every content window.
+    let transition = crate::project::normalize_transition(&ctx.project.settings.transition);
+    let durations: Vec<f64> = plan.items.iter().map(|planned| planned.duration).collect();
+    let x = blend_length(transition, &durations);
+    // Snap the blend to the output frame grid: ffmpeg emits whole frames, so
+    // an off-grid x makes every blend segment round up a frame and the file
+    // ends up ~1 frame longer per transition.
+    let fps = ctx.project.settings.fps as f64;
+    let x = if x > 0.0 { (x * fps).round() / fps } else { 0.0 };
+    let blends_enabled = x > 0.0 && matches!(transition, "crossfade" | "slide" | "checkerboard");
+    let total = plan.total_duration - plan.items.len().saturating_sub(1) as f64 * x;
 
     let cache_dir = ctx.dir.join(CACHE_DIR);
     std::fs::create_dir_all(&cache_dir)
@@ -214,31 +320,118 @@ pub async fn export_project(
 
     // Segments. Items sharing a hash encode once; independent segments encode
     // in parallel (bounded) — per-segment cost is dominated by image decode +
-    // scale, which parallelizes well across cores.
-    let total_items = plan.items.len();
-    let mut list_entries: Vec<String> = Vec::with_capacity(total_items);
-    #[derive(Clone)]
-    struct ItemInfo {
-        kind: &'static str,
-        asset_name: String,
+    // scale, which parallelizes well across cores. With transitions on, each
+    // adjacent pair also contributes one cached blend segment, interleaved as
+    // content0, blend01, content1, blend12, … contentN.
+    enum Job {
+        Content {
+            spec: ffmpeg::EncodeSpec,
+            media: PathBuf,
+            segment_kind: ffmpeg::SegmentKind,
+            duration: f64,
+            stage: &'static str,
+            asset_name: String,
+        },
+        Blend {
+            spec: ffmpeg::EncodeSpec,
+            a_media: PathBuf,
+            a_trim: f64,
+            a_dur: f64,
+            a_kind: ffmpeg::SegmentKind,
+            a_fit: crate::project::Fit,
+            b_media: PathBuf,
+            b_trim: f64,
+            b_kind: ffmpeg::SegmentKind,
+            b_fit: crate::project::Fit,
+            x: f64,
+            transition: &'static str,
+            asset_name: String,
+        },
     }
-    struct JobData {
-        media: PathBuf,
-        spec: ffmpeg::EncodeSpec,
-        segment_kind: ffmpeg::SegmentKind,
-        duration: f64,
-    }
-    let mut entries: Vec<(String, ItemInfo)> = Vec::with_capacity(total_items); // (hash, info)
-    let mut job_data: std::collections::HashMap<String, JobData> =
-        std::collections::HashMap::new();
 
-    for planned in plan.items.iter() {
-        let item = ctx
-            .project
+    impl Job {
+        fn stage(&self) -> &'static str {
+            match self {
+                Job::Content { stage, .. } => stage,
+                Job::Blend { .. } => "transition",
+            }
+        }
+        fn asset_name(&self) -> &str {
+            match self {
+                Job::Content { asset_name, .. } | Job::Blend { asset_name, .. } => asset_name,
+            }
+        }
+        fn build_args(&self, encoder: ffmpeg::Encoder, staging: &Path) -> Vec<String> {
+            match self {
+                Job::Content {
+                    spec,
+                    media,
+                    segment_kind,
+                    duration,
+                    ..
+                } => {
+                    let mut spec = spec.clone();
+                    spec.encoder = encoder;
+                    ffmpeg::segment_command(media, staging, &spec, *segment_kind, *duration)
+                }
+                Job::Blend {
+                    spec,
+                    a_media,
+                    a_trim,
+                    a_dur,
+                    a_kind,
+                    a_fit,
+                    b_media,
+                    b_trim,
+                    b_kind,
+                    b_fit,
+                    x,
+                    transition,
+                    ..
+                } => {
+                    let mut spec = spec.clone();
+                    spec.encoder = encoder;
+                    ffmpeg::transition_command(
+                        a_media, *a_trim, *a_dur, b_media, *b_trim, *x, staging, &spec, transition,
+                        *a_kind, *b_kind, *a_fit, *b_fit,
+                    )
+                }
+            }
+        }
+    }
+
+    let item_for = |item_id: &str| {
+        ctx.project
             .items
             .iter()
-            .find(|it| it.id == planned.item_id)
-            .ok_or("The slideshow changed while exporting.")?;
+            .find(|it| it.id == item_id)
+            .ok_or("The slideshow changed while exporting.")
+    };
+    let media_name = |media: &Path| -> String {
+        media
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "photo".to_string())
+    };
+    let segment_kind_of = |planned: &crate::timeline::PlannedItem| -> ffmpeg::SegmentKind {
+        match planned.kind {
+            crate::project::AssetKind::Video => ffmpeg::SegmentKind::Video {
+                trim_start: planned.trim_start,
+            },
+            _ => ffmpeg::SegmentKind::Image,
+        }
+    };
+
+    // Jobs are collected in stable (first-occurrence) timeline order;
+    // completions arrive in any order and each emits one "preparing" tick so
+    // the bar never stalls.
+    let n = plan.items.len();
+    let mut entries: Vec<String> = Vec::with_capacity(2 * n - 1); // concat list order
+    let mut jobs: Vec<(String, Job)> = Vec::new();
+    let mut queued: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (index, planned) in plan.items.iter().enumerate() {
+        let item = item_for(&planned.item_id)?;
         let spec = ffmpeg::EncodeSpec {
             width: ctx.project.settings.width,
             height: ctx.project.settings.height,
@@ -248,6 +441,7 @@ pub async fn export_project(
             encoder,
             fit: item.fit,
             background: ctx.project.settings.background,
+            kenburns: transition == "kenburns",
         };
         let kind = match planned.kind {
             crate::project::AssetKind::Image => "image",
@@ -255,42 +449,83 @@ pub async fn export_project(
             crate::project::AssetKind::Audio => unreachable!("plan() rejects audio items"),
         };
         let media = Path::new(&planned.media_path);
-        let hash = segment_hash(media, &spec, kind, planned.duration, planned.trim_start);
-        if job_data.contains_key(&hash) || cache_dir.join(format!("{hash}.ts")).exists() {
-            entries.push((hash, ItemInfo { kind, asset_name: String::new() }));
-            continue;
-        }
-        let segment_kind = match planned.kind {
-            crate::project::AssetKind::Video => ffmpeg::SegmentKind::Video {
-                trim_start: planned.trim_start,
-            },
-            _ => ffmpeg::SegmentKind::Image,
-        };
-        let name = media
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "photo".to_string());
-        job_data.insert(
-            hash.clone(),
-            JobData {
-                media: media.to_path_buf(),
-                spec,
-                segment_kind,
-                duration: planned.duration,
-            },
+        let (window_start, window_len) = content_window(index, n, planned.duration, x);
+        let hash = segment_hash(
+            media,
+            &spec,
+            kind,
+            planned.duration,
+            planned.trim_start,
+            window_start,
+            window_len,
         );
-        entries.push((hash, ItemInfo { kind, asset_name: name }));
-    }
+        entries.push(hash.clone());
+        if !queued.contains(&hash) && !cache_dir.join(format!("{hash}.ts")).exists() {
+            queued.insert(hash.clone());
+            let segment_kind = match planned.kind {
+                crate::project::AssetKind::Video => ffmpeg::SegmentKind::Video {
+                    trim_start: planned.trim_start + window_start,
+                },
+                _ => ffmpeg::SegmentKind::Image,
+            };
+            jobs.push((
+                hash,
+                Job::Content {
+                    spec: spec.clone(),
+                    media: media.to_path_buf(),
+                    segment_kind,
+                    duration: window_len,
+                    stage: if kind == "image" { "photo" } else { "video" },
+                    asset_name: media_name(media),
+                },
+            ));
+        }
 
-    // Jobs in stable (first-occurrence) item order; completions arrive in any
-    // order and each emits one "preparing" tick so the bar never stalls.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut jobs: Vec<(String, ItemInfo, JobData)> = Vec::new();
-    for (hash, info) in entries.iter() {
-        if job_data.contains_key(hash) && seen.insert(hash.clone()) {
-            jobs.push((hash.clone(), info.clone(), job_data.remove(hash).unwrap()));
+        if blends_enabled && index + 1 < n {
+            let next = &plan.items[index + 1];
+            let next_item = item_for(&next.item_id)?;
+            let a_media = Path::new(&planned.media_path);
+            let b_media = Path::new(&next.media_path);
+            let hash = transition_hash(
+                a_media,
+                b_media,
+                &spec,
+                transition,
+                x,
+                planned.trim_start + planned.duration - x,
+                next.trim_start,
+                item.fit,
+                next_item.fit,
+            );
+            entries.push(hash.clone());
+            if !queued.contains(&hash) && !cache_dir.join(format!("{hash}.ts")).exists() {
+                queued.insert(hash.clone());
+                jobs.push((
+                    hash,
+                    Job::Blend {
+                        spec: spec.clone(),
+                        a_media: a_media.to_path_buf(),
+                        a_trim: planned.trim_start,
+                        a_dur: planned.duration,
+                        a_kind: segment_kind_of(planned),
+                        a_fit: item.fit,
+                        b_media: b_media.to_path_buf(),
+                        b_trim: next.trim_start,
+                        b_kind: segment_kind_of(next),
+                        b_fit: next_item.fit,
+                        x,
+                        transition,
+                        asset_name: format!(
+                            "{} and {}",
+                            media_name(a_media),
+                            media_name(b_media)
+                        ),
+                    },
+                ));
+            }
         }
     }
+    let total_items = entries.len();
 
     let cpu_cap = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     // GPU encoder sessions are limited (consumer GPUs cap concurrent NVENC
@@ -327,7 +562,7 @@ pub async fn export_project(
         });
     }
     if job_count > 0 {
-        let mut stream = futures::stream::iter(jobs.into_iter().map(|(hash, info, data)| {
+        let mut stream = futures::stream::iter(jobs.into_iter().map(|(hash, job)| {
             let segment = cache.join(format!("{hash}.ts"));
             async move {
                 if ctl.cancelled() {
@@ -336,18 +571,8 @@ pub async fn export_project(
                 // Encode to a .part file, then rename, so an aborted run never
                 // leaves a truncated segment that looks cached.
                 let staging = cache.join(format!("{hash}.ts.part"));
-                let stage = if info.kind == "image" { "photo" } else { "video" };
-                let build_args = |enc: ffmpeg::Encoder| {
-                    let mut spec = data.spec.clone();
-                    spec.encoder = enc;
-                    ffmpeg::segment_command(
-                        &data.media,
-                        &staging,
-                        &spec,
-                        data.segment_kind,
-                        data.duration,
-                    )
-                };
+                let stage = job.stage();
+                let build_args = |enc: ffmpeg::Encoder| job.build_args(enc, &staging);
                 let mut enc = encoder_from_u8(active.load(std::sync::atomic::Ordering::SeqCst));
                 let mut args = build_args(enc);
                 let mut result =
@@ -373,7 +598,7 @@ pub async fn export_project(
                             let _ = std::fs::remove_file(&staging);
                             return Err(format!(
                                 "“{}” could not be turned into video.",
-                                info.asset_name
+                                job.asset_name()
                             ));
                         }
                         std::fs::rename(&staging, &segment)
@@ -407,9 +632,10 @@ pub async fn export_project(
     if ctl.cancelled() {
         return Err(CANCELLED.to_string());
     }
-    for (hash, _) in entries.iter() {
-        list_entries.push(format!("file '{}'", escape_concat_path(&cache_dir.join(format!("{hash}.ts")))));
-    }
+    let list_entries: Vec<String> = entries
+        .iter()
+        .map(|hash| format!("file '{}'", escape_concat_path(&cache_dir.join(format!("{hash}.ts")))))
+        .collect();
 
     // Concat (stream copy)
     on_progress(&ProgressEvent {
@@ -516,12 +742,76 @@ mod tests {
             encoder: crate::ffmpeg::Encoder::Libx264,
             fit: crate::project::Fit::Contain,
             background: crate::project::Background::Black,
+            kenburns: false,
         };
-        let a = segment_hash(&media, &spec(), "image", 3.0, 0.0);
-        let b = segment_hash(&media, &spec(), "image", 4.0, 0.0);
-        let c = segment_hash(&media, &spec(), "image", 3.0, 0.0);
+        let a = segment_hash(&media, &spec(), "image", 3.0, 0.0, 0.0, 3.0);
+        let b = segment_hash(&media, &spec(), "image", 4.0, 0.0, 0.0, 4.0);
+        let c = segment_hash(&media, &spec(), "image", 3.0, 0.0, 0.0, 3.0);
+        // Same item duration but a shifted transition window must not collide.
+        let d = segment_hash(&media, &spec(), "image", 3.0, 0.0, 0.75, 2.25);
+        let kb = {
+            let mut s = spec();
+            s.kenburns = true;
+            segment_hash(&media, &s, "image", 3.0, 0.0, 0.0, 3.0)
+        };
         assert_ne!(a, b, "different durations must not share a cache entry");
         assert_eq!(a, c, "same inputs must reuse the cache entry");
+        assert_ne!(a, d, "different content windows must not share a cache entry");
+        assert_ne!(a, kb, "Ken Burns segments must not reuse plain segments");
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn transition_hash_is_order_sensitive_and_stable() {
+        let a = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let b = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/export.rs");
+        let spec = EncodeSpec {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            crf: 21,
+            preset: "medium".to_string(),
+            encoder: crate::ffmpeg::Encoder::Libx264,
+            fit: crate::project::Fit::Contain,
+            background: crate::project::Background::Black,
+            kenburns: false,
+        };
+        let ab = transition_hash(&a, &b, &spec, "crossfade", 0.75, 2.25, 0.0, crate::project::Fit::Contain, crate::project::Fit::Contain);
+        let ab2 = transition_hash(&a, &b, &spec, "crossfade", 0.75, 2.25, 0.0, crate::project::Fit::Contain, crate::project::Fit::Contain);
+        let ba = transition_hash(&b, &a, &spec, "crossfade", 0.75, 2.25, 0.0, crate::project::Fit::Contain, crate::project::Fit::Contain);
+        let slide = transition_hash(&a, &b, &spec, "slide", 0.75, 2.25, 0.0, crate::project::Fit::Contain, crate::project::Fit::Contain);
+        assert_eq!(ab, ab2);
+        assert_ne!(ab, ba, "a→b blends differ from b→a");
+        assert_ne!(ab, slide, "blend style is part of the key");
+    }
+
+    #[test]
+    fn three_equal_photos_shift_middle_window() {
+        // n = 3, min duration 3 s => x = min(0.75, (3 − 0.3) / 2) = 0.75.
+        assert_eq!(blend_length("crossfade", &[3.0, 3.0, 3.0]), 0.75);
+        assert_eq!(content_window(0, 3, 3.0, 0.75), (0.0, 2.25));
+        assert_eq!(content_window(1, 3, 3.0, 0.75), (0.75, 1.5));
+        assert_eq!(content_window(2, 3, 3.0, 0.75), (0.75, 2.25));
+        // Σ durations − (n−1)·x = 9 − 1.5; windows sum to the same: 2.25+1.5+2.25 + 2·0.75.
+        assert_eq!(2.25 + 1.5 + 2.25 + 2.0 * 0.75, 9.0 - 2.0 * 0.75);
+    }
+
+    #[test]
+    fn blend_length_follows_the_contract_formula() {
+        // n = 2: x = min(0.75, minDur − 0.3).
+        assert!((blend_length("slide", &[1.0, 1.0]) - 0.7).abs() < 1e-9);
+        assert_eq!(blend_length("crossfade", &[6.0, 6.0]), 0.75);
+        // Tiny durations: below 0.2 s of blend there are no transitions at all.
+        assert_eq!(blend_length("crossfade", &[0.4, 0.4]), 0.0);
+        assert_eq!(blend_length("crossfade", &[0.4, 0.4, 5.0, 5.0]), 0.0);
+        // none/kenburns/single item: untouched timeline.
+        assert_eq!(blend_length("none", &[3.0, 3.0]), 0.0);
+        assert_eq!(blend_length("kenburns", &[3.0, 3.0, 3.0]), 0.0);
+        assert_eq!(blend_length("crossfade", &[3.0]), 0.0);
+        // Unknown styles clamp to none.
+        assert_eq!(blend_length("wiggle", &[3.0, 3.0]), 0.0);
+        // kenburns/none keep full windows.
+        assert_eq!(content_window(1, 3, 3.0, 0.0), (0.0, 3.0));
+        assert_eq!(content_window(0, 1, 3.0, 0.75), (0.0, 3.0));
     }
 }

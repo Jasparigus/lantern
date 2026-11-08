@@ -55,6 +55,8 @@ struct SettingsPatch {
     background: Option<Background>,
     #[serde(default)]
     default_image_duration: Option<f64>,
+    #[serde(default)]
+    transition: Option<String>,
 }
 
 const PRESETS: &[&str] = &[
@@ -398,6 +400,10 @@ fn settings_set(app: AppHandle, patch: SettingsPatch) -> Result<ProjectSnapshot,
         }
         if let Some(duration) = patch.default_image_duration {
             project.settings.default_image_duration = duration.clamp(0.5, 120.0);
+        }
+        if let Some(transition) = patch.transition {
+            // Unknown styles clamp to "none", mirroring the encoder/background guards.
+            project.settings.transition = project::normalize_transition(&transition).to_string();
         }
         Ok(project)
     })

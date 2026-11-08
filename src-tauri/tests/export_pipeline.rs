@@ -319,3 +319,172 @@ async fn full_pipeline_produces_playable_mp4() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn crossfade_export_adds_transitions() {
+    let Some(bins) = engine() else {
+        eprintln!("skipping export_pipeline test: no ffmpeg engine available");
+        return;
+    };
+
+    let dir = workdir("crossfade");
+    generate_inputs(&bins, &dir);
+
+    let mut ctx = ProjectCtx::create(&dir, "Blend Show").expect("create project");
+    ctx.project.settings.preset = "veryfast".to_string();
+    ctx.project.settings.crf = 30;
+    ctx.project.settings.background = Background::Blur;
+    ctx.project.settings.transition = "crossfade".to_string();
+
+    let files: Vec<String> = [
+        "beach 2019.jpg",
+        "portrait.png",
+        "family-clip.mp4",
+        "song.wav",
+    ]
+    .iter()
+    .map(|name| dir.join(name).display().to_string())
+    .collect();
+    let outcome = media::import(&bins, &ctx.dir, &mut ctx.project, &files).await;
+    assert!(outcome.skipped.is_empty(), "unexpected skips: {outcome:?}");
+    assert_eq!(outcome.added.len(), 4);
+    assert_eq!(ctx.project.items.len(), 3);
+    assert!(ctx.project.audio.is_some());
+
+    // A cover-cropped photo exercises per-item fits on both sides of a blend.
+    let portrait_id = ctx
+        .project
+        .assets
+        .values()
+        .find(|asset| asset.file_name.ends_with("portrait.png"))
+        .expect("portrait asset")
+        .id
+        .clone();
+    for item in &mut ctx.project.items {
+        if item.asset_id == portrait_id {
+            item.fit = Fit::Cover;
+        }
+    }
+    ctx.save().expect("save edits");
+
+    // 3 s + 3 s photos + the whole 2.5 s clip; min duration 2.5 s => x = 0.75 s.
+    let ctl = Arc::new(ExportCtl::new());
+    ctl.begin().expect("begin");
+    let out_path = dir.join("out").join("blend.mp4");
+    let mut events: Vec<(String, usize, usize)> = Vec::new();
+    let result = export::export_project(
+        &bins,
+        &ctx,
+        &out_path,
+        &ctl,
+        &mut |event| events.push((event.phase.clone(), event.index, event.total)),
+    )
+    .await;
+    ctl.end();
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(e) => panic!("crossfade export failed: {e}",),
+    };
+
+    // Three content segments + two pair blends, all prepared.
+    assert_eq!(
+        events.iter().filter(|(phase, ..)| phase == "preparing").count(),
+        5,
+        "expected 3 content + 2 blend prepares: {events:?}"
+    );
+    assert!(events.iter().all(|(_, _, total)| *total == 5), "{events:?}");
+    assert!(events.iter().any(|(phase, ..)| phase == "stitching"));
+    assert!(events.iter().any(|(phase, ..)| phase == "music"));
+
+    // Σ durations − (n−1)·0.75 = 8.5 − 1.5 = 7.0.
+    assert!(
+        (summary.total_duration - 7.0).abs() < 0.3,
+        "transition-adjusted duration drifted: {}",
+        summary.total_duration
+    );
+
+    let out_path = PathBuf::from(&summary.out_path);
+    assert!(out_path.exists());
+
+    let codecs = ffprobe_text(
+        &bins,
+        &out_path,
+        &["-show_entries", "stream=codec_name", "-of", "csv=p=0"],
+    );
+    let codecs: Vec<&str> = codecs.lines().map(str::trim).collect();
+    assert!(codecs.contains(&"h264"), "codecs: {codecs:?}");
+    assert!(codecs.contains(&"aac"), "codecs: {codecs:?}");
+
+    let duration: f64 = ffprobe_text(
+        &bins,
+        &out_path,
+        &["-show_entries", "format=duration", "-of", "default=nk=1:nw=1"],
+    )
+    .trim()
+    .parse()
+    .expect("duration parse");
+    assert!(
+        (duration - 7.0).abs() < 0.3,
+        "blended timeline should shrink to ~7.0 s: {duration}"
+    );
+
+    let pixel_format = ffprobe_text(
+        &bins,
+        &out_path,
+        &["-show_entries", "stream=codec_name,pix_fmt,avg_frame_rate", "-of", "csv=p=0"],
+    );
+    assert!(pixel_format.contains("yuv420p"), "{pixel_format}");
+    assert!(
+        pixel_format.contains("30/1"),
+        "expected constant 30 fps: {pixel_format}"
+    );
+
+    // Five cached segments (3 content + 2 blends) survive the export.
+    let cache_dir = dir.join("Blend Show.lantern/cache");
+    let segment_mtimes: Vec<std::time::SystemTime> = std::fs::read_dir(&cache_dir)
+        .expect("cache dir")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.file_name().to_string_lossy().ends_with(".ts").then(|| {
+                entry.metadata().ok().and_then(|m| m.modified().ok())
+            })?
+        })
+        .collect();
+    assert_eq!(segment_mtimes.len(), 5, "expected five cached segments");
+
+    // Second run reuses every content and blend segment.
+    ctl.begin().expect("begin 2");
+    let out2 = dir.join("out").join("blend2.mp4");
+    let mut second_events: Vec<(String, usize, usize)> = Vec::new();
+    let result2 = export::export_project(
+        &bins,
+        &ctx,
+        &out2,
+        &ctl,
+        &mut |event| second_events.push((event.phase.clone(), event.index, event.total)),
+    )
+    .await;
+    ctl.end();
+    assert!(result2.is_ok(), "re-export failed: {:?}", result2.err());
+    assert_eq!(
+        second_events.iter().filter(|(phase, ..)| phase == "preparing").count(),
+        1,
+        "cached export should emit one reuse tick"
+    );
+    let segment_mtimes_after: Vec<std::time::SystemTime> = std::fs::read_dir(&cache_dir)
+        .expect("cache dir")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.file_name().to_string_lossy().ends_with(".ts").then(|| {
+                entry.metadata().ok().and_then(|m| m.modified().ok())
+            })?
+        })
+        .collect();
+    assert_eq!(
+        segment_mtimes, segment_mtimes_after,
+        "cached segments (blends included) must not be re-encoded"
+    );
+    assert!(out2.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

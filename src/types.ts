@@ -3,6 +3,7 @@
 export type AssetKind = "image" | "video" | "audio";
 export type Fit = "contain" | "cover";
 export type Background = "black" | "white" | "blur";
+export type Transition = "none" | "crossfade" | "slide" | "checkerboard" | "kenburns";
 
 export interface Asset {
   id: string;
@@ -31,6 +32,7 @@ export interface Settings {
   encoder: "auto" | "cpu" | "gpu";
   background: Background;
   defaultImageDuration: number;
+  transition: Transition;
 }
 
 export interface AudioSettings {
@@ -116,6 +118,7 @@ export interface SettingsPatch {
   encoder?: "auto" | "cpu" | "gpu";
   background?: Background;
   defaultImageDuration?: number;
+  transition?: Transition;
 }
 
 export function formatSeconds(value: number): string {

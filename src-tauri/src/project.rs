@@ -49,10 +49,29 @@ pub struct Settings {
     pub encoder: String,
     pub background: Background,
     pub default_image_duration: f64,
+    /// "none" | "crossfade" | "slide" | "checkerboard" | "kenburns" — one motion
+    /// style for the whole show. Normalized by `normalize_transition`.
+    #[serde(default = "default_transition")]
+    pub transition: String,
 }
 
 fn default_encoder() -> String {
     "auto".to_string()
+}
+
+fn default_transition() -> String {
+    "none".to_string()
+}
+
+/// The transition styles this app understands. Anything else clamps to "none".
+pub const TRANSITIONS: &[&str] = &["none", "crossfade", "slide", "checkerboard", "kenburns"];
+
+pub fn normalize_transition(value: &str) -> &'static str {
+    TRANSITIONS
+        .iter()
+        .copied()
+        .find(|t| *t == value)
+        .unwrap_or("none")
 }
 
 impl Default for Settings {
@@ -66,6 +85,7 @@ impl Default for Settings {
             encoder: "auto".to_string(),
             background: Background::Black,
             default_image_duration: 3.0,
+            transition: "none".to_string(),
         }
     }
 }
@@ -433,5 +453,24 @@ mod tests {
         assert_eq!(sanitize_project_name("a/b:c").unwrap(), "a-b-c");
         assert!(sanitize_project_name("   ").is_err());
         assert!(sanitize_project_name("...").is_err());
+    }
+
+    #[test]
+    fn transition_defaults_to_none_when_absent() {
+        let json = r#"{"version":1,"settings":{"width":1920,"height":1080,"fps":30,"crf":21,"preset":"medium","background":"black","defaultImageDuration":3.0},"audio":null,"items":[],"assets":{}}"#;
+        let project: Project = serde_json::from_str(json).unwrap();
+        assert_eq!(project.settings.transition, "none");
+    }
+
+    #[test]
+    fn transition_roundtrips_and_normalizes() {
+        let mut project = Project::default();
+        project.settings.transition = "checkerboard".to_string();
+        let json = serde_json::to_string(&project).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.settings.transition, "checkerboard");
+        assert_eq!(normalize_transition("kenburns"), "kenburns");
+        assert_eq!(normalize_transition("wiggle"), "none");
+        assert_eq!(normalize_transition(""), "none");
     }
 }

@@ -19,6 +19,10 @@ static ffmpeg sidecar.
 - Music: one song, Soft/Balanced/Loud presets, auto fade-out at the end,
   auto-loop when the song is shorter than the slideshow.
 - Preview: plays the slideshow with your music before rendering.
+- Motion between photos (More options): None, Crossfade, Slide, Checkerboard
+  wipe, or Ken Burns photo zoom — set once for the whole slideshow. Crossfade,
+  slide and checkerboard overlap their neighbours by up to 0.75 s each, so the
+  finished video is a little shorter than the sum of the clip times.
 - Export: MP4 (H.264 High profile, yuv420p, +faststart) + AAC. Resolution
   480/720/1080/2K/4K in wide, vertical, or square; quality presets; smoothness
   24/30/60 fps; black/white/blurred letterbox background. Encoding runs on the

@@ -3,6 +3,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -41,6 +42,11 @@ import {
   type RecentProject,
   type Snapshot,
 } from "./types";
+import {
+  planDurations,
+  showDurationSeconds,
+  transitionBlendSeconds,
+} from "./transitions";
 
 // ---------------------------------------------------------------- helpers
 
@@ -480,6 +486,12 @@ function Editor({
   const songAsset = project.audio
     ? project.assets[project.audio.assetId]
     : null;
+  // The plan reports raw segment lengths; transitions shorten the show.
+  const showDuration = showDurationSeconds(
+    project.settings.transition,
+    planDurations(plan.items),
+    project.settings.fps,
+  );
 
   return (
     <div className="editor">
@@ -536,7 +548,7 @@ function Editor({
               {plan.items.length > 0 && (
                 <>
                   {" · "}
-                  <span className="strip-total">{formatClock(plan.totalDuration)}</span>
+                  <span className="strip-total">{formatClock(showDuration)}</span>
                 </>
               )}
             </h2>
@@ -621,7 +633,7 @@ function Editor({
           </div>
           <ul className="export-summary">
             <li>{plan.items.length} clips</li>
-            <li>{formatClock(plan.totalDuration)} long</li>
+            <li>{formatClock(showDuration)} long</li>
             <li>
               {project.settings.height >= 2000
                 ? "4K"
@@ -1327,6 +1339,13 @@ function OptionsSheet({
     { label: "Black", value: "black" as const },
     { label: "White", value: "white" as const },
   ];
+  const motions = [
+    { label: "None", value: "none" as const },
+    { label: "Crossfade", value: "crossfade" as const },
+    { label: "Slide", value: "slide" as const },
+    { label: "Checkerboard", value: "checkerboard" as const },
+    { label: "Ken Burns (photo zoom)", value: "kenburns" as const },
+  ];
 
   const currentShape =
     settings.width > settings.height
@@ -1428,6 +1447,23 @@ function OptionsSheet({
         </div>
       </div>
       <div className="option-group">
+        <h4>Motion between photos</h4>
+        <div className="chip-row">
+          {motions.map((motion) => (
+            <button
+              key={motion.value}
+              className={`chip ${settings.transition === motion.value ? "active" : ""}`}
+              onClick={() =>
+                apply(() => api.settingsSet({ transition: motion.value }))
+              }
+            >
+              {motion.label}
+            </button>
+          ))}
+        </div>
+        <p className="option-hint">Applies to the whole slideshow.</p>
+      </div>
+      <div className="option-group">
         <h4>Encoding</h4>
         <div className="chip-row">
           {encoders.map((encoder) => (
@@ -1486,12 +1522,51 @@ function Preview({
   onClose: () => void;
 }) {
   const items = snapshot.plan.items;
+  const transition = snapshot.project.settings.transition;
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(true);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const atEnd = index >= items.length;
   const item = atEnd ? null : items[index];
+  const nextItem = index + 1 < items.length ? items[index + 1] : null;
+  const durations = planDurations(items);
+  const blend = transitionBlendSeconds(
+    transition,
+    durations,
+    snapshot.project.settings.fps,
+  );
+  const showDuration = showDurationSeconds(
+    transition,
+    durations,
+    snapshot.project.settings.fps,
+  );
+  const slotSeconds = item?.duration ?? 0;
+  // Only photo-to-photo pairs get blended in the preview; videos keep their
+  // own timing and stay exactly as they were.
+  const blending =
+    blend > 0 &&
+    transition !== "kenburns" &&
+    item?.kind === "image" &&
+    nextItem?.kind === "image";
+  // The blend sits at the tail of the current photo's slot, so slot timing
+  // still adds up to the plain sum of the segments.
+  const overlapStyle = (name: string): CSSProperties => ({
+    animationName: name,
+    animationDuration: `${blend * 1000}ms`,
+    animationDelay: `${Math.max(0, slotSeconds - blend) * 1000}ms`,
+    animationFillMode: "both",
+    animationTimingFunction: "ease-in-out",
+  });
+  // Ken Burns: a slow zoom across the whole slot, photos only.
+  const kenburnsStyle: CSSProperties = {
+    animationName: "preview-kenburns",
+    animationDuration: `${slotSeconds * 1000}ms`,
+    animationFillMode: "both",
+    animationTimingFunction: "linear",
+  };
+  const outgoingName = transition === "slide" ? "preview-slide-out" : "preview-fade-out";
+  const incomingName = transition === "slide" ? "preview-slide-in" : "preview-fade-in";
 
   const advance = useCallback(() => {
     setIndex((current) => current + 1);
@@ -1533,8 +1608,29 @@ function Preview({
   return (
     <div className="preview">
       <div className="preview-stage">
+        {/* The incoming photo sits underneath and fades/slides in while the
+            outgoing one leaves — the preview approximation of the export's
+            blend. A checkerboard export wipes through a checker mask; the
+            preview keeps it cheap with the same crossfade. */}
+        {blending && nextItem && (
+          <div className="preview-in" style={overlapStyle(incomingName)}>
+            <img src={convertFileSrc(nextItem.mediaPath)} alt="" />
+          </div>
+        )}
         {item && item.kind === "image" && (
-          <img key={item.itemId} src={convertFileSrc(item.mediaPath)} alt="" />
+          <img
+            key={item.itemId}
+            className="preview-out"
+            src={convertFileSrc(item.mediaPath)}
+            alt=""
+            style={
+              transition === "kenburns"
+                ? kenburnsStyle
+                : blending
+                  ? overlapStyle(outgoingName)
+                  : undefined
+            }
+          />
         )}
         {item && item.kind === "video" && (
           <video
@@ -1586,7 +1682,7 @@ function Preview({
         <span>
           {atEnd
             ? `${items.length} / ${items.length}`
-            : `${index + 1} / ${items.length} · ${formatClock(snapshot.plan.totalDuration)}`}
+            : `${index + 1} / ${items.length} · ${formatClock(showDuration)}`}
         </span>
         <span className="preview-hint">
           <kbd>Space</kbd> pause · <kbd>←</kbd> <kbd>→</kbd> skip ·{" "}

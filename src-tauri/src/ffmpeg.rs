@@ -226,6 +226,8 @@ pub struct EncodeSpec {
     pub encoder: Encoder,
     pub fit: Fit,
     pub background: Background,
+    /// Ken Burns zoom-in motion on image segments (videos are unaffected).
+    pub kenburns: bool,
 }
 
 /// ffmpeg options for one asset -> one normalized MPEG-TS segment.
@@ -296,10 +298,131 @@ pub fn segment_filter(spec: &EncodeSpec) -> FilterPlan {
     }
 }
 
+/// Ken Burns: scale the normalized frame up to 2x the target first, then let
+/// zoompan zoom the centre window from 1.0 to 1.18 over the segment. `d` is
+/// the exact frame count so zoompan itself generates every output frame — no
+/// tpad cloning, and `fps` makes the output constant-rate. The step is chosen
+/// so the zoom reaches 1.18 exactly on the last frame.
+fn kenburns_filter(spec: &EncodeSpec, frames: i64) -> FilterPlan {
+    let w = spec.width;
+    let h = spec.height;
+    let w2 = w * 2;
+    let h2 = h * 2;
+    let zstep = 0.18 / (frames.max(1) as f64);
+    let zoom = format!(
+        "zoompan=z='min(zoom+{zstep:.6},1.18)':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={}",
+        spec.fps
+    );
+    // zoompan already fixes size and rate, so the tail is the SAR/range/format
+    // end only; the muxer's `-r` keeps the stream constant-frame-rate.
+    let upload = if spec.encoder.needs_hwupload() {
+        ",format=nv12,hwupload"
+    } else {
+        ",format=yuv420p"
+    };
+    match (spec.fit, spec.background) {
+        (Fit::Cover, _) => FilterPlan::Simple(format!(
+            "scale={w2}:{h2}:force_original_aspect_ratio=increase,crop={w2}:{h2},{zoom},setsar=1{upload}"
+        )),
+        (Fit::Contain, Background::Blur) => FilterPlan::Complex(format!(
+            concat!(
+                "[0:v]split=2[fg][bg];",
+                "[bg]scale={w2}:{h2}:force_original_aspect_ratio=increase,crop={w2}:{h2},gblur=sigma=20[bgb];",
+                "[fg]scale={w2}:{h2}:force_original_aspect_ratio=decrease[fgs];",
+                "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,{zoom},setsar=1{upload}[vout]"
+            ),
+            w2 = w2,
+            h2 = h2,
+            zoom = zoom,
+            upload = upload
+        )),
+        (Fit::Contain, background) => FilterPlan::Simple(format!(
+            concat!(
+                "scale={w2}:{h2}:force_original_aspect_ratio=decrease,",
+                "pad={w2}:{h2}:(ow-iw)/2:(oh-ih)/2:color={bg},",
+                "{zoom},setsar=1{upload}"
+            ),
+            w2 = w2,
+            h2 = h2,
+            bg = background_color(background),
+            zoom = zoom,
+            upload = upload
+        )),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum SegmentKind {
     Image,
     Video { trim_start: f64 },
+}
+
+/// Encoder selection + quality flags, identical for every encoded segment so
+/// the concat demuxer can stream-copy them losslessly back together.
+fn encoder_args(spec: &EncodeSpec) -> Vec<String> {
+    match spec.encoder {
+        Encoder::Libx264 => vec![
+            String::from("-c:v"),
+            String::from("libx264"),
+            String::from("-preset"),
+            spec.preset.clone(),
+            String::from("-crf"),
+            spec.crf.to_string(),
+        ],
+        Encoder::Nvenc => vec![
+            String::from("-c:v"),
+            String::from("h264_nvenc"),
+            String::from("-preset"),
+            String::from(match spec.crf {
+                0..=18 => "p6",
+                19..=23 => "p5",
+                _ => "p4",
+            }),
+            String::from("-rc"),
+            String::from("constqp"),
+            String::from("-cq"),
+            spec.crf.to_string(),
+        ],
+        Encoder::Amf => vec![
+            String::from("-c:v"),
+            String::from("h264_amf"),
+            String::from("-quality"),
+            String::from(match spec.crf {
+                0..=18 => "quality",
+                19..=23 => "balanced",
+                _ => "speed",
+            }),
+            String::from("-rc"),
+            String::from("cqp"),
+            String::from("-qp_i"),
+            spec.crf.to_string(),
+            String::from("-qp_p"),
+            spec.crf.to_string(),
+        ],
+        Encoder::VideoToolbox => vec![
+            String::from("-c:v"),
+            String::from("h264_videotoolbox"),
+            // VideoToolbox takes a 1-99 quality dial instead of CRF.
+            String::from("-q:v"),
+            ((51 - spec.crf) * 2).clamp(1, 99).to_string(),
+        ],
+        Encoder::Qsv => vec![
+            String::from("-c:v"),
+            String::from("h264_qsv"),
+            String::from("-rc"),
+            String::from("cqp"),
+            String::from("-global_quality"),
+            spec.crf.to_string(),
+        ],
+        Encoder::Vaapi => vec![
+            String::from("-c:v"),
+            String::from("h264_vaapi"),
+            String::from("-rc"),
+            String::from("cqp"),
+            String::from("-global_quality"),
+            spec.crf.to_string(),
+        ],
+    }
 }
 
 /// `<ffmpeg> -y ... -i <media> ... -f mpegts <out>`: one timeline item encoded to a
@@ -334,100 +457,58 @@ pub fn segment_command(
         }
     }
     args.extend([String::from("-i"), media.display().to_string()]);
-    match segment_filter(spec) {
-        FilterPlan::Simple(mut chain) => {
-            if matches!(kind, SegmentKind::Image) {
-                chain.push_str(&format!(
-                    ",tpad=stop_mode=clone:stop_duration={}",
-                    format_seconds(duration)
-                ));
-            }
-            args.extend([String::from("-vf"), chain]);
-        }
-        FilterPlan::Complex(mut graph) => {
-            if matches!(kind, SegmentKind::Image) {
-                if let Some(at) = graph.rfind("[vout]") {
-                    graph.insert_str(
-                        at,
-                        &format!(
-                            ",tpad=stop_mode=clone:stop_duration={}",
-                            format_seconds(duration)
-                        ),
-                    );
+    match kind {
+        SegmentKind::Image if spec.kenburns => {
+            // zoompan generates every output frame itself (`d` frames at the
+            // segment fps), so no tpad clone is needed — only the -t output cap.
+            let frames = (duration * f64::from(spec.fps)).round().max(1.0) as i64;
+            match kenburns_filter(spec, frames) {
+                FilterPlan::Simple(chain) => {
+                    args.extend([String::from("-vf"), chain]);
+                }
+                FilterPlan::Complex(graph) => {
+                    args.extend([
+                        String::from("-filter_complex"),
+                        graph,
+                        String::from("-map"),
+                        String::from("[vout]"),
+                    ]);
                 }
             }
-            args.extend([
-                String::from("-filter_complex"),
-                graph,
-                String::from("-map"),
-                String::from("[vout]"),
-            ]);
         }
+        _ => match segment_filter(spec) {
+            FilterPlan::Simple(mut chain) => {
+                if matches!(kind, SegmentKind::Image) {
+                    chain.push_str(&format!(
+                        ",tpad=stop_mode=clone:stop_duration={}",
+                        format_seconds(duration)
+                    ));
+                }
+                args.extend([String::from("-vf"), chain]);
+            }
+            FilterPlan::Complex(mut graph) => {
+                if matches!(kind, SegmentKind::Image) {
+                    if let Some(at) = graph.rfind("[vout]") {
+                        graph.insert_str(
+                            at,
+                            &format!(
+                                ",tpad=stop_mode=clone:stop_duration={}",
+                                format_seconds(duration)
+                            ),
+                        );
+                    }
+                }
+                args.extend([
+                    String::from("-filter_complex"),
+                    graph,
+                    String::from("-map"),
+                    String::from("[vout]"),
+                ]);
+            }
+        },
     }
     args.extend([String::from("-r"), spec.fps.to_string()]);
-    match spec.encoder {
-        Encoder::Libx264 => args.extend([
-            String::from("-c:v"),
-            String::from("libx264"),
-            String::from("-preset"),
-            spec.preset.clone(),
-            String::from("-crf"),
-            spec.crf.to_string(),
-        ]),
-        Encoder::Nvenc => args.extend([
-            String::from("-c:v"),
-            String::from("h264_nvenc"),
-            String::from("-preset"),
-            String::from(match spec.crf {
-                0..=18 => "p6",
-                19..=23 => "p5",
-                _ => "p4",
-            }),
-            String::from("-rc"),
-            String::from("constqp"),
-            String::from("-cq"),
-            spec.crf.to_string(),
-        ]),
-        Encoder::Amf => args.extend([
-            String::from("-c:v"),
-            String::from("h264_amf"),
-            String::from("-quality"),
-            String::from(match spec.crf {
-                0..=18 => "quality",
-                19..=23 => "balanced",
-                _ => "speed",
-            }),
-            String::from("-rc"),
-            String::from("cqp"),
-            String::from("-qp_i"),
-            spec.crf.to_string(),
-            String::from("-qp_p"),
-            spec.crf.to_string(),
-        ]),
-        Encoder::VideoToolbox => args.extend([
-            String::from("-c:v"),
-            String::from("h264_videotoolbox"),
-            // VideoToolbox takes a 1-99 quality dial instead of CRF.
-            String::from("-q:v"),
-            ((51 - spec.crf) * 2).clamp(1, 99).to_string(),
-        ]),
-        Encoder::Qsv => args.extend([
-            String::from("-c:v"),
-            String::from("h264_qsv"),
-            String::from("-rc"),
-            String::from("cqp"),
-            String::from("-global_quality"),
-            spec.crf.to_string(),
-        ]),
-        Encoder::Vaapi => args.extend([
-            String::from("-c:v"),
-            String::from("h264_vaapi"),
-            String::from("-rc"),
-            String::from("cqp"),
-            String::from("-global_quality"),
-            spec.crf.to_string(),
-        ]),
-    }
+    args.extend(encoder_args(spec));
     if !spec.encoder.needs_hwupload() {
         // JPEG photos decode as full-range (yuvj420p); TVs and most players
         // expect standard limited range, so every segment is forced to tv
@@ -441,6 +522,173 @@ pub fn segment_command(
         String::from("-an"),
         String::from("-t"),
         format_seconds(duration),
+        String::from("-f"),
+        String::from("mpegts"),
+        out.display().to_string(),
+    ]);
+    args
+}
+
+/// Seconds of overlap each adjacent pair of items shares when a transition is
+/// on (clamped further by item durations in the export planner).
+pub const TRANSITION_SECONDS: f64 = 0.75;
+
+/// Normalizing prefix for input `idx` of a multi-input filter graph: the exact
+/// scale/pad chain `segment_filter` uses so every blend input lands at target
+/// WxH, SAR 1 — identical pixel geometry on both sides of an xfade. `tail` is
+/// appended verbatim; `label` names the output pad.
+fn normalize_fragment(spec: &EncodeSpec, idx: usize, fit: Fit, tail: &str, label: &str) -> String {
+    let w = spec.width;
+    let h = spec.height;
+    match (fit, spec.background) {
+        (Fit::Cover, _) => format!(
+            "[{idx}:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}{tail}[{label}]"
+        ),
+        (Fit::Contain, Background::Blur) => format!(
+            "[{idx}:v]split=2[fg{idx}][bg{idx}];\
+             [bg{idx}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},gblur=sigma=20[bgb{idx}];\
+             [fg{idx}]scale={w}:{h}:force_original_aspect_ratio=decrease[fgs{idx}];\
+             [bgb{idx}][fgs{idx}]overlay=(W-w)/2:(H-h)/2{tail}[{label}]"
+        ),
+        (Fit::Contain, background) => format!(
+            "[{idx}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,\
+             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={}{tail}[{label}]",
+            background_color(background)
+        ),
+    }
+}
+
+fn upload_tail(spec: &EncodeSpec) -> &'static str {
+    if spec.encoder.needs_hwupload() {
+        ",format=nv12,hwupload"
+    } else {
+        ",format=yuv420p"
+    }
+}
+
+fn image_loop(x: &str) -> String {
+    format!(",tpad=stop_mode=clone:stop_duration={x}")
+}
+
+/// `<ffmpeg> -y ... -i a -i b -filter_complex ... -f mpegts <out>`: the x-second
+/// blend between item a's tail and item b's head, nothing else. Videos are cut
+/// to the exact window with input seeking (a: `[a_trim + a_dur − x, +x]`,
+/// b: `[b_trim, +x]`); images loop one decoded frame over the window. xfade
+/// starts the transition at offset 0, so the whole output is the blend, and
+/// `-t x` caps any clone rounding on the image sides. Encoder flags are
+/// byte-identical to `segment_command`, keeping the segment concat-compatible.
+pub fn transition_command(
+    a_media: &Path,
+    a_trim: f64,
+    a_dur: f64,
+    b_media: &Path,
+    b_trim: f64,
+    x: f64,
+    out: &Path,
+    spec: &EncodeSpec,
+    transition: &str,
+    a_kind: SegmentKind,
+    b_kind: SegmentKind,
+    a_fit: Fit,
+    b_fit: Fit,
+) -> Vec<String> {
+    let xs = format_seconds(x);
+    let mut args = vec![
+        String::from("-y"),
+        String::from("-hide_banner"),
+        String::from("-loglevel"),
+        String::from("error"),
+    ];
+    if let SegmentKind::Video { .. } = a_kind {
+        args.extend([
+            String::from("-ss"),
+            format_seconds(a_trim + a_dur - x),
+            String::from("-t"),
+            xs.clone(),
+        ]);
+    }
+    args.extend([String::from("-i"), a_media.display().to_string()]);
+    if let SegmentKind::Video { .. } = b_kind {
+        args.extend([String::from("-ss"), format_seconds(b_trim), String::from("-t"), xs.clone()]);
+    }
+    args.extend([String::from("-i"), b_media.display().to_string()]);
+
+    let sync = format!(",setsar=1,fps={}", spec.fps);
+    let a_image = matches!(a_kind, SegmentKind::Image);
+    let b_image = matches!(b_kind, SegmentKind::Image);
+    let graph = if transition == "checkerboard" {
+        // True checkerboard: a gray mask whose cells (64 px squares) reveal in
+        // a diagonal wavefront — cell c's alpha ramps clamp((T/x)·C − c, 0, 1)
+        // for c = floor(X/64) + floor(Y/64) over C diagonals, so the sweep is
+        // monotone and fully revealed exactly at T = x. b is alpha-merged with
+        // that mask and overlaid on a.
+        let cells = (spec.width + 63) / 64 + (spec.height + 63) / 64 - 1;
+        let expr = format!(
+            "255*clip((T/{xs})*{cells}-(floor(X/64)+floor(Y/64)),0,1)"
+        );
+        format!(
+            "{};{};nullsrc=s={}x{}:r={}:d={xs},geq=lum='{}':cb=128:cr=128,format=gray[mask];\
+             [nb][mask]alphamerge[bm];[na][bm]overlay=0:0[vx];[vx]setsar=1{}[vout]",
+            normalize_fragment(
+                spec,
+                0,
+                a_fit,
+                &format!("{sync},format=yuv420p{}", if a_image { image_loop(&xs) } else { String::new() }),
+                "na",
+            ),
+            normalize_fragment(
+                spec,
+                1,
+                b_fit,
+                &format!("{sync},format=yuva420p{}", if b_image { image_loop(&xs) } else { String::new() }),
+                "nb",
+            ),
+            spec.width,
+            spec.height,
+            spec.fps,
+            expr,
+            upload_tail(spec),
+        )
+    } else {
+        let name = if transition == "slide" { "slideleft" } else { "fade" };
+        format!(
+            "{};{};[na][nb]xfade=transition={name}:duration={xs}:offset=0[vx];\
+             [vx]setsar=1,fps={}{}[vout]",
+            normalize_fragment(
+                spec,
+                0,
+                a_fit,
+                &format!("{sync},format=yuv420p{}", if a_image { image_loop(&xs) } else { String::new() }),
+                "na",
+            ),
+            normalize_fragment(
+                spec,
+                1,
+                b_fit,
+                &format!("{sync},format=yuv420p{}", if b_image { image_loop(&xs) } else { String::new() }),
+                "nb",
+            ),
+            spec.fps,
+            upload_tail(spec),
+        )
+    };
+    args.extend([
+        String::from("-filter_complex"),
+        graph,
+        String::from("-map"),
+        String::from("[vout]"),
+    ]);
+    args.extend([String::from("-r"), spec.fps.to_string()]);
+    args.extend(encoder_args(spec));
+    if !spec.encoder.needs_hwupload() {
+        args.extend([String::from("-pix_fmt"), String::from("yuv420p")]);
+    }
+    args.extend([
+        String::from("-color_range"),
+        String::from("tv"),
+        String::from("-an"),
+        String::from("-t"),
+        xs,
         String::from("-f"),
         String::from("mpegts"),
         out.display().to_string(),
@@ -598,6 +846,7 @@ mod tests {
             encoder: Encoder::Libx264,
             fit: Fit::Contain,
             background: Background::Black,
+            kenburns: false,
         }
     }
 
@@ -796,5 +1045,124 @@ mod tests {
         );
         let joined = args.join(" ");
         assert!(joined.contains("-f concat -safe 0 -i /p/cache/list.txt -c copy -f mpegts"));
+    }
+
+    #[test]
+    fn crossfade_blend_maps_two_loops_through_xfade() {
+        let args = transition_command(
+            Path::new("/p/media/a.jpg"),
+            0.0,
+            3.0,
+            Path::new("/p/media/b.jpg"),
+            0.0,
+            TRANSITION_SECONDS,
+            Path::new("/p/cache/blend.ts"),
+            &spec(),
+            "crossfade",
+            SegmentKind::Image,
+            SegmentKind::Image,
+            Fit::Contain,
+            Fit::Contain,
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("-i /p/media/a.jpg -i /p/media/b.jpg"), "{joined}");
+        // Images: no input seeking, each side loops its single decoded frame.
+        assert!(!joined.contains("-ss"));
+        assert_eq!(joined.matches("tpad=stop_mode=clone:stop_duration=0.750").count(), 2);
+        assert!(joined.contains("xfade=transition=fade:duration=0.750:offset=0[vx]"));
+        assert!(joined.contains("-filter_complex") && joined.contains("-map [vout]"));
+        // Encoder args identical to segment_command for the same spec.
+        assert!(joined.contains("-c:v libx264 -preset medium -crf 21"));
+        assert!(joined.contains("-pix_fmt yuv420p -color_range tv -an -t 0.750 -f mpegts"));
+        assert!(args.last().unwrap().ends_with("blend.ts"));
+    }
+
+    #[test]
+    fn slide_blend_cuts_video_windows_around_the_cut() {
+        let args = transition_command(
+            Path::new("/p/media/a.mp4"),
+            0.5,
+            2.5,
+            Path::new("/p/media/b.mp4"),
+            1.5,
+            TRANSITION_SECONDS,
+            Path::new("/p/cache/blend.ts"),
+            &spec(),
+            "slide",
+            SegmentKind::Video { trim_start: 0.5 },
+            SegmentKind::Video { trim_start: 1.5 },
+            Fit::Contain,
+            Fit::Cover,
+        );
+        let joined = args.join(" ");
+        // a's tail window [0.5 + 2.5 − 0.75, +0.75]; b's head window [1.5, +0.75].
+        assert!(joined.contains("-ss 2.250 -t 0.750 -i /p/media/a.mp4"), "{joined}");
+        assert!(joined.contains("-ss 1.500 -t 0.750 -i /p/media/b.mp4"), "{joined}");
+        assert!(joined.contains("xfade=transition=slideleft:duration=0.750:offset=0[vx]"));
+        // Video sides loop nothing.
+        assert!(!joined.contains("tpad"));
+        assert!(joined.contains("crop=1920:1080")); // b normalizes with its own cover fit
+    }
+
+    #[test]
+    fn checkerboard_blend_builds_a_sweeping_cell_mask() {
+        let args = transition_command(
+            Path::new("/p/media/a.jpg"),
+            0.0,
+            3.0,
+            Path::new("/p/media/b.jpg"),
+            0.0,
+            TRANSITION_SECONDS,
+            Path::new("/p/cache/blend.ts"),
+            &spec(),
+            "checkerboard",
+            SegmentKind::Image,
+            SegmentKind::Image,
+            Fit::Contain,
+            Fit::Contain,
+        );
+        let joined = args.join(" ");
+        // 1920x1080 => 30 columns + 17 rows => 46 diagonals; diagonal sweep.
+        assert!(joined.contains(
+            "geq=lum='255*clip((T/0.750)*46-(floor(X/64)+floor(Y/64)),0,1)':cb=128:cr=128"
+        ), "{joined}");
+        assert!(joined.contains("[nb][mask]alphamerge[bm];[na][bm]overlay=0:0[vx]"));
+        assert!(!joined.contains("xfade"));
+        assert!(joined.contains("-an"));
+        assert!(joined.contains("-c:v libx264 -preset medium -crf 21"));
+        assert!(joined.contains("-f mpegts"));
+    }
+
+    #[test]
+    fn kenburns_images_zoompan_exact_frame_counts() {
+        let mut s = spec();
+        s.kenburns = true;
+        let joined = segment_command(
+            Path::new("/p/media/a.jpg"),
+            Path::new("/p/cache/seg.ts"),
+            &s,
+            SegmentKind::Image,
+            3.0,
+        )
+        .join(" ");
+        // d = round(3 s * 30 fps); step makes zoom land on 1.18 at the last frame.
+        assert!(joined.contains("zoompan=z='min(zoom+0.002000,1.18)':d=90"), "{joined}");
+        assert!(joined.contains("s=1920x1080:fps=30"));
+        // 2x target first so the zoom window stays sharper than the output.
+        assert!(joined.contains("scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2:color=black"));
+        assert!(!joined.contains("tpad"));
+        assert!(joined.contains("-an -t 3.000 -f mpegts"));
+
+        // Videos are unaffected by Ken Burns.
+        let video = segment_command(
+            Path::new("/p/media/v.mp4"),
+            Path::new("/p/cache/seg2.ts"),
+            &s,
+            SegmentKind::Video { trim_start: 1.0 },
+            4.0,
+        )
+        .join(" ");
+        assert!(!video.contains("zoompan"));
+        assert!(video.contains("-ss 1.000 -t 4.000 -i /p/media/v.mp4"));
     }
 }
