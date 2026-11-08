@@ -69,8 +69,7 @@ them:
 
 - **Linux:** AppImage + `.deb` + `.rpm` (Ubuntu 24.04 runner)
 - **macOS:** universal (Apple silicon + Intel) `.dmg` (macOS runner)
-- **Windows:** NSIS `.exe` installer + no-install portable `.zip` (`Lantern.exe`
-  with bundled ffmpeg sidecars; unzip anywhere, run directly)
+- **Windows:** NSIS `.exe` + `.msi` (Windows runner)
 
 Released installers: <https://github.com/Jasparigus/lantern/releases>
 

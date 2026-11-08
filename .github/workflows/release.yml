@@ -22,10 +22,10 @@ jobs:
             build-args: "--target universal-apple-darwin --bundles dmg"
             artifact-path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
           - os: windows-latest
-            build-args: "--bundles nsis"
+            build-args: "--bundles nsis,msi"
             artifact-path: |
               src-tauri/target/release/bundle/nsis/*.exe
-              Lantern_*_windows-portable.zip
+              src-tauri/target/release/bundle/msi/*.msi
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -66,17 +66,6 @@ jobs:
 
       - name: Build and bundle
         run: npm run tauri build -- ${{ matrix.build-args }}
-
-      - name: Package portable folder
-        if: matrix.os == 'windows-latest'
-        run: |
-          $ver = node -p "require('./package.json').version"
-          New-Item -ItemType Directory -Force portable | Out-Null
-          Copy-Item src-tauri/target/release/lantern.exe portable/Lantern.exe
-          Copy-Item src-tauri/binaries/ffmpeg-*.exe portable/
-          Copy-Item src-tauri/binaries/ffprobe-*.exe portable/
-          Copy-Item LICENSE portable/
-          Compress-Archive -Path portable/* -DestinationPath "Lantern_${ver}_windows-portable.zip"
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
