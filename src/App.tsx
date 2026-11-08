@@ -315,6 +315,7 @@ function Editor({
   const { project, plan, dir } = snapshot;
   const [previewOpen, setPreviewOpen] = useState(false);
   const [optionsOpen, setOptionsOpen] = useState(false);
+  const [viewerIndex, setViewerIndex] = useState<number | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportJob, setExportJob] = useState<ExportJob | null>(null);
   const exporting = exportJob?.phase === "running";
@@ -555,6 +556,7 @@ function Editor({
               onTrim={async (itemId, trimStart, duration) =>
                 apply(() => api.itemSetTrim(itemId, trimStart, duration))
               }
+              onView={(index) => setViewerIndex(index)}
             />
           )}
         </section>
@@ -572,7 +574,7 @@ function Editor({
             apply={apply}
           />
           <div className="rail-hint">
-            <p>Drag cards to reorder.</p>
+            <p>Drag cards to reorder · double-click a card to zoom in.</p>
             <p>
               Tap a time to change one photo · <kbd>Ctrl</kbd>+<kbd>Z</kbd> to
               undo.
@@ -585,6 +587,15 @@ function Editor({
         <Preview
           snapshot={snapshot}
           onClose={() => setPreviewOpen(false)}
+        />
+      )}
+
+      {viewerIndex !== null && plan.items[viewerIndex] && (
+        <MediaViewer
+          items={plan.items}
+          index={viewerIndex}
+          onIndexChange={setViewerIndex}
+          onClose={() => setViewerIndex(null)}
         />
       )}
 
@@ -761,6 +772,7 @@ function Filmstrip({
   onDuration,
   onFit,
   onTrim,
+  onView,
 }: {
   plan: Snapshot["plan"];
   onMove: (from: number, to: number) => void;
@@ -768,6 +780,7 @@ function Filmstrip({
   onDuration: (itemId: string, seconds: number) => void;
   onFit: (itemId: string, fit: "contain" | "cover") => void;
   onTrim: (itemId: string, trimStart: number, duration: number) => void;
+  onView: (index: number) => void;
 }) {
   const ids = plan.items.map((item) => item.itemId);
   const sensors = useSensors(
@@ -798,6 +811,7 @@ function Filmstrip({
               onTrim={(trimStart, duration) =>
                 onTrim(item.itemId, trimStart, duration)
               }
+              onView={() => onView(index)}
             />
           ))}
         </div>
@@ -813,6 +827,7 @@ function FilmCard({
   onDuration,
   onFit,
   onTrim,
+  onView,
 }: {
   item: PlannedItem;
   index: number;
@@ -820,6 +835,7 @@ function FilmCard({
   onDuration: (seconds: number) => void;
   onFit: () => void;
   onTrim: (trimStart: number, duration: number) => void;
+  onView: () => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: item.itemId });
@@ -864,6 +880,10 @@ function FilmCard({
       ref={setNodeRef}
       style={style}
       className={`film-card ${isDragging ? "dragging" : ""}`}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        onView();
+      }}
       {...attributes}
       {...listeners}
     >
@@ -873,6 +893,17 @@ function FilmCard({
         <div className="card-unknown">{item.kind}</div>
       )}
       <div className="card-index">{index + 1}</div>
+      <button
+        className="card-view"
+        title="Zoom in"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          onView();
+        }}
+      >
+        ⤢
+      </button>
       <button
         className="card-remove"
         title="Remove"
@@ -992,6 +1023,154 @@ function FilmCard({
           }}
         >
           {item.fit === "cover" ? "fill" : "inside"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Full-size zoom viewer for inspecting one item while arranging.
+function MediaViewer({
+  items,
+  index,
+  onIndexChange,
+  onClose,
+}: {
+  items: Snapshot["plan"]["items"];
+  index: number;
+  onIndexChange: (index: number) => void;
+  onClose: () => void;
+}) {
+  const item = items[index];
+  const isImage = item.kind !== "video";
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<{ px: number; py: number; x: number; y: number } | null>(null);
+  const [view, setView] = useState({ scale: 1, x: 0, y: 0 });
+
+  const reset = () => setView({ scale: 1, x: 0, y: 0 });
+
+  useEffect(() => {
+    reset();
+    dragRef.current = null;
+  }, [item.itemId]);
+
+  const zoomAt = (factor: number, clientX?: number, clientY?: number) => {
+    const stage = stageRef.current;
+    setView(({ scale, x, y }) => {
+      const next = Math.min(8, Math.max(1, scale * factor));
+      if (next === scale) return { scale, x, y };
+      if (next === 1) return { scale: 1, x: 0, y: 0 };
+      if (!stage || clientX === undefined || clientY === undefined) {
+        return { scale: next, x, y };
+      }
+      // Keep the point under the cursor fixed while scaling.
+      const rect = stage.getBoundingClientRect();
+      const vx = clientX - (rect.left + rect.width / 2);
+      const vy = clientY - (rect.top + rect.height / 2);
+      const k = next / scale;
+      return { scale: next, x: vx - (vx - x) * k, y: vy - (vy - y) * k };
+    });
+  };
+
+  // React onWheel is passive; wheel needs preventDefault to stop page scroll.
+  const zoomRef = useRef(zoomAt);
+  zoomRef.current = zoomAt;
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      zoomRef.current(event.deltaY < 0 ? 1.2 : 1 / 1.2, event.clientX, event.clientY);
+    };
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
+  }, []);
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft") onIndexChange(Math.max(0, index - 1));
+      if (event.key === "ArrowRight") onIndexChange(Math.min(items.length - 1, index + 1));
+      if (event.key === "+" || event.key === "=") zoomRef.current(1.25);
+      if (event.key === "-") zoomRef.current(1 / 1.25);
+      if (event.key === "0") reset();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [index, items.length, onClose, onIndexChange]);
+
+  return (
+    <div className="viewer" role="dialog" aria-modal="true" aria-label="Zoomed photo">
+      <div className="viewer-stage" ref={stageRef}>
+        {isImage ? (
+          <img
+            className={`viewer-media ${view.scale > 1 ? "zoomed" : ""}`}
+            src={convertFileSrc(item.mediaPath)}
+            alt=""
+            draggable={false}
+            style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
+            onPointerDown={(e) => {
+              if (view.scale <= 1) return;
+              dragRef.current = { px: e.clientX, py: e.clientY, x: view.x, y: view.y };
+              e.currentTarget.setPointerCapture(e.pointerId);
+            }}
+            onPointerMove={(e) => {
+              const drag = dragRef.current;
+              if (!drag) return;
+              setView((v) => ({ ...v, x: drag.x + e.clientX - drag.px, y: drag.y + e.clientY - drag.py }));
+            }}
+            onPointerUp={() => {
+              dragRef.current = null;
+            }}
+            onPointerCancel={() => {
+              dragRef.current = null;
+            }}
+            onDoubleClick={(e) => {
+              zoomAt(view.scale > 1 ? 1 / view.scale : 3, e.clientX, e.clientY);
+            }}
+          />
+        ) : (
+          <video className="viewer-media" src={convertFileSrc(item.mediaPath)} controls autoPlay playsInline />
+        )}
+      </div>
+      <div className="viewer-bar">
+        <button
+          className="viewer-nav"
+          title="Previous item"
+          disabled={index === 0}
+          onClick={() => onIndexChange(index - 1)}
+        >
+          ‹
+        </button>
+        <span className="viewer-count">
+          {index + 1} / {items.length}
+        </span>
+        <button
+          className="viewer-nav"
+          title="Next item"
+          disabled={index === items.length - 1}
+          onClick={() => onIndexChange(index + 1)}
+        >
+          ›
+        </button>
+        {isImage && (
+          <span className="viewer-zoom">
+            <button title="Zoom out" onClick={() => zoomAt(1 / 1.25)}>
+              −
+            </button>
+            <button title="Fit to window" onClick={reset}>
+              100%
+            </button>
+            <button title="Zoom in" onClick={() => zoomAt(1.25)}>
+              +
+            </button>
+          </span>
+        )}
+        <span className="viewer-hint">
+          {isImage ? "scroll to zoom · drag to pan · double-click to toggle" : "video"} · ← → flip · Esc close
+        </span>
+        <button className="viewer-close" onClick={onClose}>
+          Close
         </button>
       </div>
     </div>

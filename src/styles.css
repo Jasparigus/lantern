@@ -449,8 +449,30 @@ button:not(:disabled):active {
 }
 
 .film-card:hover .card-remove,
-.film-card.dragging .card-remove {
+.film-card.dragging .card-remove,
+.film-card:hover .card-view,
+.film-card.dragging .card-view {
   opacity: 1;
+}
+
+.card-view {
+  position: absolute;
+  top: 6px;
+  right: 42px;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--fg);
+  font-size: 1rem;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.card-view:hover {
+  background: var(--accent);
+  color: var(--bg-deep);
 }
 
 .card-remove:hover {
@@ -871,4 +893,89 @@ button:not(:disabled):active {
 
 .preview-hint {
   opacity: 0.8;
+}
+
+/* Full-size zoom viewer */
+.viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: rgba(10, 9, 8, 0.94);
+  display: flex;
+  flex-direction: column;
+}
+
+.viewer-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.viewer-media {
+  max-width: 100%;
+  max-height: 100%;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.viewer-media.zoomed {
+  cursor: grab;
+  max-width: none;
+  max-height: none;
+}
+
+.viewer-media.zoomed:active {
+  cursor: grabbing;
+}
+
+.viewer-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.9rem;
+  flex-wrap: wrap;
+}
+
+.viewer-nav,
+.viewer-zoom button {
+  min-width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--card);
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+
+.viewer-nav:disabled {
+  opacity: 0.35;
+}
+
+.viewer-zoom {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.viewer-count {
+  color: var(--accent-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+.viewer-hint {
+  flex: 1;
+  opacity: 0.8;
+}
+
+.viewer-close {
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
 }
