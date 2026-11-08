@@ -255,9 +255,13 @@ async fn full_pipeline_produces_playable_mp4() {
     let pixel_format = ffprobe_text(
         &bins,
         &out_path,
-        &["-show_entries", "stream=codec_name,pix_fmt", "-of", "csv=p=0"],
+        &["-show_entries", "stream=codec_name,pix_fmt,avg_frame_rate", "-of", "csv=p=0"],
     );
     assert!(pixel_format.contains("yuv420p"), "{pixel_format}");
+    assert!(
+        pixel_format.contains("30/1"),
+        "expected constant 30 fps: {pixel_format}"
+    );
 
     // +faststart: moov must precede mdat so playback starts before download ends.
     let bytes = std::fs::read(&out_path).expect("read output");

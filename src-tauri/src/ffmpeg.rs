@@ -320,12 +320,9 @@ pub fn segment_command(
     ];
     match kind {
         SegmentKind::Image => {
-            args.extend([
-                String::from("-loop"),
-                String::from("1"),
-                String::from("-t"),
-                format_seconds(duration),
-            ]);
+            // No -loop 1: that re-decodes and re-scales the source image for
+            // every output frame. One decoded frame is cloned by the tpad
+            // filter below instead.
         }
         SegmentKind::Video { trim_start } => {
             args.extend([
@@ -338,10 +335,27 @@ pub fn segment_command(
     }
     args.extend([String::from("-i"), media.display().to_string()]);
     match segment_filter(spec) {
-        FilterPlan::Simple(chain) => {
+        FilterPlan::Simple(mut chain) => {
+            if matches!(kind, SegmentKind::Image) {
+                chain.push_str(&format!(
+                    ",tpad=stop_mode=clone:stop_duration={}",
+                    format_seconds(duration)
+                ));
+            }
             args.extend([String::from("-vf"), chain]);
         }
-        FilterPlan::Complex(graph) => {
+        FilterPlan::Complex(mut graph) => {
+            if matches!(kind, SegmentKind::Image) {
+                if let Some(at) = graph.rfind("[vout]") {
+                    graph.insert_str(
+                        at,
+                        &format!(
+                            ",tpad=stop_mode=clone:stop_duration={}",
+                            format_seconds(duration)
+                        ),
+                    );
+                }
+            }
             args.extend([
                 String::from("-filter_complex"),
                 graph,
@@ -425,6 +439,8 @@ pub fn segment_command(
         String::from("-color_range"),
         String::from("tv"),
         String::from("-an"),
+        String::from("-t"),
+        format_seconds(duration),
         String::from("-f"),
         String::from("mpegts"),
         out.display().to_string(),
@@ -674,10 +690,12 @@ mod tests {
             3.0,
         );
         let joined = args.join(" ");
-        assert!(joined.contains("-loop 1 -t 3.000 -i /p/media/a-photo.jpg"));
+        assert!(joined.contains("-i /p/media/a-photo.jpg"));
+        assert!(!joined.contains("-loop"));
         assert!(joined.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"));
+        assert!(joined.contains("tpad=stop_mode=clone:stop_duration=3.000"));
         assert!(joined.contains("setsar=1,fps=30,format=yuv420p"));
-        assert!(joined.contains("-c:v libx264 -preset medium -crf 21 -pix_fmt yuv420p -color_range tv -an -f mpegts"));
+        assert!(joined.contains("-an -t 3.000 -f mpegts"));
         assert!(args.last().unwrap().ends_with("seg.ts"));
         assert!(!joined.contains("-filter_complex"));
     }

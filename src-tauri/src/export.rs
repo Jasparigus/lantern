@@ -298,7 +298,7 @@ pub async fn export_project(
     let worker_cap = if encoder == ffmpeg::Encoder::Libx264 {
         cpu_cap.min(4)
     } else {
-        3
+        4
     };
     let workers = jobs.len().min(worker_cap);
     let job_count = jobs.len();
