@@ -44,8 +44,15 @@ pub struct Settings {
     pub fps: u32,
     pub crf: u32,
     pub preset: String,
+    /// "auto" | "cpu" | "gpu" — resolved against the machine at export time.
+    #[serde(default = "default_encoder")]
+    pub encoder: String,
     pub background: Background,
     pub default_image_duration: f64,
+}
+
+fn default_encoder() -> String {
+    "auto".to_string()
 }
 
 impl Default for Settings {
@@ -56,6 +63,7 @@ impl Default for Settings {
             fps: 30,
             crf: 21,
             preset: "medium".to_string(),
+            encoder: "auto".to_string(),
             background: Background::Black,
             default_image_duration: 3.0,
         }

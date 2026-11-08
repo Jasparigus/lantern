@@ -28,6 +28,7 @@ export interface Settings {
   fps: number;
   crf: number;
   preset: string;
+  encoder: "auto" | "cpu" | "gpu";
   background: Background;
   defaultImageDuration: number;
 }
@@ -103,13 +104,16 @@ export interface ProgressEvent {
 export interface ExportSummary {
   outPath: string;
   totalDuration: number;
+  encoder: string;
 }
 
 export interface SettingsPatch {
   width?: number;
   height?: number;
+  fps?: number;
   crf?: number;
   preset?: string;
+  encoder?: "auto" | "cpu" | "gpu";
   background?: Background;
   defaultImageDuration?: number;
 }

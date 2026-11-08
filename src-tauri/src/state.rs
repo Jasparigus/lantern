@@ -1,14 +1,17 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use tokio::process::Child;
 
 /// Shared control for the single export job: who is running, whether the user
-/// asked to stop, and the ffmpeg child currently executing (so cancel kills it).
+/// asked to stop, and the ffmpeg children currently executing (so cancel kills
+/// them all). Stages attach their child and pass the returned id back to
+/// `detach`/`try_wait`, which makes concurrent stages safe.
 pub struct ExportCtl {
     running: AtomicBool,
     cancel: AtomicBool,
-    child: Mutex<Option<Child>>,
+    next_child_id: AtomicU64,
+    children: Mutex<Vec<(u64, Child)>>,
 }
 
 impl Default for ExportCtl {
@@ -22,7 +25,8 @@ impl ExportCtl {
         ExportCtl {
             running: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
-            child: Mutex::new(None),
+            next_child_id: AtomicU64::new(1),
+            children: Mutex::new(Vec::new()),
         }
     }
 
@@ -32,58 +36,66 @@ impl ExportCtl {
             return Err("A video is already being created.".to_string());
         }
         self.cancel.store(false, Ordering::SeqCst);
+        self.children.lock().unwrap().clear();
         Ok(())
     }
 
     pub fn end(&self) {
-        self.kill_child();
-        *self.child.lock().unwrap() = None;
+        self.kill_children();
+        self.children.lock().unwrap().clear();
         self.running.store(false, Ordering::SeqCst);
     }
 
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        self.kill_child();
+        self.kill_children();
     }
 
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }
 
-    fn child_guard(&self) -> MutexGuard<'_, Option<Child>> {
-        self.child.lock().unwrap()
+    fn children_guard(&self) -> MutexGuard<'_, Vec<(u64, Child)>> {
+        self.children.lock().unwrap()
     }
 
-    pub fn attach(&self, child: Child) {
-        *self.child_guard() = Some(child);
+    /// Registers a running ffmpeg child; hand the id to `detach`/`try_wait`.
+    pub fn attach(&self, child: Child) -> u64 {
+        let id = self.next_child_id.fetch_add(1, Ordering::SeqCst);
+        self.children_guard().push((id, child));
+        id
     }
 
-    pub fn detach(&self) {
+    pub fn detach(&self, id: u64) {
         // Dropping a tokio Child kills+reaps the process (kill_on_drop).
-        let _ = self.child_guard().take();
+        let mut guard = self.children_guard();
+        if let Some(pos) = guard.iter().position(|(child_id, _)| *child_id == id) {
+            guard.swap_remove(pos);
+        }
     }
 
-    fn kill_child(&self) {
-        if let Some(child) = self.child_guard().as_mut() {
+    fn kill_children(&self) {
+        for (_, child) in self.children_guard().iter_mut() {
             let _ = child.start_kill();
         }
     }
 
-    /// `Some(Ok(status))` once the attached child has exited (and is reaped),
-    /// `None` while it is still running.
-    pub fn try_wait(&self) -> Option<std::io::Result<std::process::ExitStatus>> {
-        let mut guard = self.child_guard();
-        let child = guard.as_mut()?;
+    /// `Some(Ok(status))` once the child with this id has exited (and is reaped),
+    /// `None` while it is still running (or the id is unknown).
+    pub fn try_wait(&self, id: u64) -> Option<std::io::Result<std::process::ExitStatus>> {
+        let mut guard = self.children_guard();
+        let pos = guard.iter().position(|(child_id, _)| *child_id == id)?;
+        let child = &mut guard[pos].1;
         match child.try_wait() {
             Ok(Some(status)) => {
-                let child = guard.take();
-                drop(child);
+                let entry = guard.swap_remove(pos);
+                drop(entry);
                 Some(Ok(status))
             }
             Ok(None) => None,
             Err(e) => {
-                let child = guard.take();
-                drop(child);
+                let entry = guard.swap_remove(pos);
+                drop(entry);
                 Some(Err(e))
             }
         }

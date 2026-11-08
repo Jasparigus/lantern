@@ -44,9 +44,13 @@ struct SettingsPatch {
     #[serde(default)]
     height: Option<u32>,
     #[serde(default)]
+    fps: Option<u32>,
+    #[serde(default)]
     crf: Option<u32>,
     #[serde(default)]
     preset: Option<String>,
+    #[serde(default)]
+    encoder: Option<String>,
     #[serde(default)]
     background: Option<Background>,
     #[serde(default)]
@@ -370,6 +374,18 @@ fn settings_set(app: AppHandle, patch: SettingsPatch) -> Result<ProjectSnapshot,
                 return Err("Quality must be between 14 and 35.".to_string());
             }
             project.settings.crf = crf;
+        }
+        if let Some(fps) = patch.fps {
+            if !(15..=60).contains(&fps) {
+                return Err("Frames per second must be between 15 and 60.".to_string());
+            }
+            project.settings.fps = fps;
+        }
+        if let Some(encoder) = patch.encoder {
+            if !matches!(encoder.as_str(), "auto" | "cpu" | "gpu") {
+                return Err("Unknown encoder choice.".to_string());
+            }
+            project.settings.encoder = encoder;
         }
         if let Some(preset) = patch.preset {
             if !PRESETS.contains(&preset.as_str()) {

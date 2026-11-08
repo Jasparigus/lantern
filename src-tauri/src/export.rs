@@ -1,20 +1,43 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 
-use crate::ffmpeg::{self, Binaries, EncodeSpec, SegmentKind};
+use crate::ffmpeg::{self, Binaries, EncodeSpec};
 use crate::project::CACHE_DIR;
 use crate::state::ExportCtl;
 use crate::timeline::{self, Plan};
 
 pub const CANCELLED: &str = "cancelled";
+/// Appended to stage errors that look like the GPU encoder failed to open,
+/// so the export loop can retry that stage on the CPU.
+const ENCODER_INIT_MARKER: &str = "\u{1}encoder-init";
 const LIST_FILE: &str = "list.txt";
 const STAGE_TIMEOUT: Duration = Duration::from_secs(900);
+
+fn encoder_from_u8(value: u8) -> ffmpeg::Encoder {
+    match value {
+        1 => ffmpeg::Encoder::Nvenc,
+        2 => ffmpeg::Encoder::Amf,
+        3 => ffmpeg::Encoder::VideoToolbox,
+        4 => ffmpeg::Encoder::Qsv,
+        5 => ffmpeg::Encoder::Vaapi,
+        _ => ffmpeg::Encoder::Libx264,
+    }
+}
+
+fn strip_encoder_marker(error: &str) -> String {
+    error
+        .split(ENCODER_INIT_MARKER)
+        .next()
+        .unwrap_or(error)
+        .to_string()
+}
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +53,7 @@ pub struct ProgressEvent {
 pub struct ExportSummary {
     pub out_path: String,
     pub total_duration: f64,
+    pub encoder: String,
 }
 
 pub fn escape_concat_path(path: &Path) -> String {
@@ -94,14 +118,15 @@ async fn run_ffmpeg_stage(
         .spawn()
         .map_err(|e| format!("Could not start the video engine ({e})."))?;
     let mut stderr = child.stderr.take().expect("stderr was piped");
-    ctl.attach(child);
+    let child_id = ctl.attach(child);
 
     let mut tail: Vec<u8> = Vec::new();
+    let mut head: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
     let started = Instant::now();
     let status = loop {
         if ctl.cancelled() {
-            ctl.detach();
+            ctl.detach(child_id);
             return Err(CANCELLED.to_string());
         }
         match tokio::time::timeout(Duration::from_millis(60), stderr.read(&mut buf)).await {
@@ -109,6 +134,9 @@ async fn run_ffmpeg_stage(
                 // Output pipe closed: the process is on its way out.
             }
             Ok(Ok(n)) => {
+                if head.len() < 8192 {
+                    head.extend_from_slice(&buf[..n]);
+                }
                 tail.extend_from_slice(&buf[..n]);
                 if tail.len() > 8192 {
                     tail = tail.split_off(tail.len() - 4096);
@@ -116,25 +144,42 @@ async fn run_ffmpeg_stage(
             }
             Err(_) => {}
         }
-        if let Some(result) = ctl.try_wait() {
+        if let Some(result) = ctl.try_wait(child_id) {
             break result.map_err(|e| format!("Could not finish {stage_name}: {e}"))?;
         }
         if started.elapsed() > STAGE_TIMEOUT {
-            ctl.detach();
+            ctl.detach(child_id);
             return Err(format!("{stage_name} took too long and was stopped."));
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
     };
-    ctl.detach();
+    ctl.detach(child_id);
 
     if !status.success() {
         let detail = String::from_utf8_lossy(&tail);
+        // Encoder-init lines may be scrolled out of the retained tail, so the
+        // first 8 KB is scanned as well.
+        let encoder_init = {
+            let head = String::from_utf8_lossy(&head);
+            let both = format!("{head}\n{detail}");
+            both.contains("Error while opening encoder")
+                || both.contains("Could not open encoder")
+                || both.contains("No capable devices")
+                || both.contains("cuCtxCreate")
+                || both.contains("InitializeEncoder failed")
+        };
+        eprintln!("ffmpeg stage {stage_name:?} failed:\n{detail}");
         let last_line = detail
             .lines()
             .rev()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("unknown error");
-        return Err(format!("{stage_name} failed: {last_line}"));
+        let message = format!("{stage_name} failed: {last_line}");
+        return Err(if encoder_init {
+            format!("{message}{ENCODER_INIT_MARKER}")
+        } else {
+            message
+        });
     }
     Ok(())
 }
@@ -162,25 +207,45 @@ pub async fn export_project(
             .map_err(|e| format!("Could not prepare the output folder: {e}"))?;
     }
 
-    // Segments
+    // Encoder preference + runtime probe: a GPU encoder that fails to
+    // initialize (broken driver session) never blocks an export.
+    let encoder = ffmpeg::resolve_encoder(bins, &ctx.project.settings.encoder);
+    println!("[export] encoder: {}", encoder.label());
+
+    // Segments. Items sharing a hash encode once; independent segments encode
+    // in parallel (bounded) — per-segment cost is dominated by image decode +
+    // scale, which parallelizes well across cores.
     let total_items = plan.items.len();
     let mut list_entries: Vec<String> = Vec::with_capacity(total_items);
-    for (i, planned) in plan.items.iter().enumerate() {
-        if ctl.cancelled() {
-            return Err(CANCELLED.to_string());
-        }
+    #[derive(Clone)]
+    struct ItemInfo {
+        kind: &'static str,
+        asset_name: String,
+    }
+    struct JobData {
+        media: PathBuf,
+        spec: ffmpeg::EncodeSpec,
+        segment_kind: ffmpeg::SegmentKind,
+        duration: f64,
+    }
+    let mut entries: Vec<(String, ItemInfo)> = Vec::with_capacity(total_items); // (hash, info)
+    let mut job_data: std::collections::HashMap<String, JobData> =
+        std::collections::HashMap::new();
+
+    for planned in plan.items.iter() {
         let item = ctx
             .project
             .items
             .iter()
             .find(|it| it.id == planned.item_id)
             .ok_or("The slideshow changed while exporting.")?;
-        let spec = EncodeSpec {
+        let spec = ffmpeg::EncodeSpec {
             width: ctx.project.settings.width,
             height: ctx.project.settings.height,
             fps: ctx.project.settings.fps,
             crf: ctx.project.settings.crf,
             preset: ctx.project.settings.preset.clone(),
+            encoder,
             fit: item.fit,
             background: ctx.project.settings.background,
         };
@@ -191,39 +256,159 @@ pub async fn export_project(
         };
         let media = Path::new(&planned.media_path);
         let hash = segment_hash(media, &spec, kind, planned.duration, planned.trim_start);
-        let segment = cache_dir.join(format!("{hash}.ts"));
+        if job_data.contains_key(&hash) || cache_dir.join(format!("{hash}.ts")).exists() {
+            entries.push((hash, ItemInfo { kind, asset_name: String::new() }));
+            continue;
+        }
+        let segment_kind = match planned.kind {
+            crate::project::AssetKind::Video => ffmpeg::SegmentKind::Video {
+                trim_start: planned.trim_start,
+            },
+            _ => ffmpeg::SegmentKind::Image,
+        };
+        let name = media
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "photo".to_string());
+        job_data.insert(
+            hash.clone(),
+            JobData {
+                media: media.to_path_buf(),
+                spec,
+                segment_kind,
+                duration: planned.duration,
+            },
+        );
+        entries.push((hash, ItemInfo { kind, asset_name: name }));
+    }
 
-        if !segment.exists() {
-            let kind_word = if kind == "image" { "photo" } else { "video" };
+    // Jobs in stable (first-occurrence) item order; completions arrive in any
+    // order and each emits one "preparing" tick so the bar never stalls.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut jobs: Vec<(String, ItemInfo, JobData)> = Vec::new();
+    for (hash, info) in entries.iter() {
+        if job_data.contains_key(hash) && seen.insert(hash.clone()) {
+            jobs.push((hash.clone(), info.clone(), job_data.remove(hash).unwrap()));
+        }
+    }
+
+    let cpu_cap = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    // GPU encoder sessions are limited (consumer GPUs cap concurrent NVENC
+    // sessions), so run fewer stages at once when encoding on the GPU.
+    let worker_cap = if encoder == ffmpeg::Encoder::Libx264 {
+        cpu_cap.min(4)
+    } else {
+        3
+    };
+    let workers = jobs.len().min(worker_cap);
+    let job_count = jobs.len();
+
+    // Live encoder choice. If GPU encoding fails mid-export (VRAM eaten by
+    // another app, driver hiccup), the first failure switches the whole
+    // remaining export to the processor and retries the failed segment.
+    let active_encoder = std::sync::atomic::AtomicU8::new(match encoder {
+        ffmpeg::Encoder::Libx264 => 0,
+        ffmpeg::Encoder::Nvenc => 1,
+        ffmpeg::Encoder::Amf => 2,
+        ffmpeg::Encoder::VideoToolbox => 3,
+        ffmpeg::Encoder::Qsv => 4,
+        ffmpeg::Encoder::Vaapi => 5,
+    });
+    let cache = &cache_dir;
+    let active = &active_encoder;
+    let mut prepared = total_items - job_count;
+    if prepared > 0 {
+        // Cached / duplicate items are already done — credit them up front.
+        on_progress(&ProgressEvent {
+            phase: "preparing".to_string(),
+            index: prepared,
+            total: total_items,
+            label: format!("Reusing {prepared} of {total_items} prepared pieces…"),
+        });
+    }
+    if job_count > 0 {
+        let mut stream = futures::stream::iter(jobs.into_iter().map(|(hash, info, data)| {
+            let segment = cache.join(format!("{hash}.ts"));
+            async move {
+                if ctl.cancelled() {
+                    return Err(CANCELLED.to_string());
+                }
+                // Encode to a .part file, then rename, so an aborted run never
+                // leaves a truncated segment that looks cached.
+                let staging = cache.join(format!("{hash}.ts.part"));
+                let stage = if info.kind == "image" { "photo" } else { "video" };
+                let build_args = |enc: ffmpeg::Encoder| {
+                    let mut spec = data.spec.clone();
+                    spec.encoder = enc;
+                    ffmpeg::segment_command(
+                        &data.media,
+                        &staging,
+                        &spec,
+                        data.segment_kind,
+                        data.duration,
+                    )
+                };
+                let mut enc = encoder_from_u8(active.load(std::sync::atomic::Ordering::SeqCst));
+                let mut args = build_args(enc);
+                let mut result =
+                    run_ffmpeg_stage(bins, &args, ctl, &format!("Preparing {stage}")).await;
+                if result.as_ref().is_err_and(|e| {
+                    e.contains(ENCODER_INIT_MARKER) && enc != ffmpeg::Encoder::Libx264
+                }) {
+                    let _ = std::fs::remove_file(&staging);
+                    active.store(0, std::sync::atomic::Ordering::SeqCst);
+                    println!(
+                        "[export] GPU encoding failed mid-export; finishing on the processor."
+                    );
+                    enc = ffmpeg::Encoder::Libx264;
+                    args = build_args(enc);
+                    result =
+                        run_ffmpeg_stage(bins, &args, ctl, &format!("Preparing {stage}")).await;
+                }
+                match result {
+                    Ok(()) => {
+                        let tiny =
+                            std::fs::metadata(&staging).map(|m| m.len() < 1024).unwrap_or(true);
+                        if tiny {
+                            let _ = std::fs::remove_file(&staging);
+                            return Err(format!(
+                                "“{}” could not be turned into video.",
+                                info.asset_name
+                            ));
+                        }
+                        std::fs::rename(&staging, &segment)
+                            .map_err(|e| format!("Could not save the prepared segment: {e}"))?;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&staging);
+                        Err(strip_encoder_marker(&e))
+                    }
+                }
+            }
+        }))
+        .buffer_unordered(workers);
+
+        while let Some(result) = stream.next().await {
+            if let Err(e) = result {
+                drop(stream);
+                return Err(e);
+            }
+            prepared += 1;
             on_progress(&ProgressEvent {
                 phase: "preparing".to_string(),
-                index: i + 1,
+                index: prepared,
                 total: total_items,
-                label: format!("Preparing {kind_word} {} of {total_items}…", i + 1),
+                label: format!("Preparing {prepared} of {total_items}…"),
             });
-            let args = ffmpeg::segment_command(
-                media,
-                &segment,
-                &spec,
-                match planned.kind {
-                    crate::project::AssetKind::Video => SegmentKind::Video {
-                        trim_start: planned.trim_start,
-                    },
-                    _ => SegmentKind::Image,
-                },
-                planned.duration,
-            );
-            run_ffmpeg_stage(bins, &args, ctl, &format!("Preparing {kind_word} {}", i + 1)).await?;
-            let tiny = std::fs::metadata(&segment).map(|m| m.len() < 1024).unwrap_or(true);
-            if tiny {
-                let _ = std::fs::remove_file(&segment);
-                return Err(format!(
-                    "“{}” could not be turned into video.",
-                    item.asset_id
-                ));
-            }
         }
-        list_entries.push(format!("file '{}'", escape_concat_path(&segment)));
+    }
+
+    if ctl.cancelled() {
+        return Err(CANCELLED.to_string());
+    }
+    for (hash, _) in entries.iter() {
+        list_entries.push(format!("file '{}'", escape_concat_path(&cache_dir.join(format!("{hash}.ts")))));
     }
 
     // Concat (stream copy)
@@ -298,6 +483,9 @@ pub async fn export_project(
     Ok(ExportSummary {
         out_path: out_path.display().to_string(),
         total_duration: total,
+        encoder: encoder_from_u8(active_encoder.load(std::sync::atomic::Ordering::SeqCst))
+            .label()
+            .to_string(),
     })
 }
 
@@ -325,6 +513,7 @@ mod tests {
             fps: 30,
             crf: 21,
             preset: "medium".to_string(),
+            encoder: crate::ffmpeg::Encoder::Libx264,
             fit: crate::project::Fit::Contain,
             background: crate::project::Background::Black,
         };

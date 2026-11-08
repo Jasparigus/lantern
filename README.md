@@ -19,9 +19,13 @@ static ffmpeg sidecar.
 - Music: one song, Soft/Balanced/Loud presets, auto fade-out at the end,
   auto-loop when the song is shorter than the slideshow.
 - Preview: plays the slideshow with your music before rendering.
-- Export: MP4 (H.264 High profile, yuv420p, +faststart) + AAC, 720p/1080p/4K,
-  quality presets, black/white/blurred letterbox background. Progress bar,
-  cancel anytime, unchanged clips are never re-encoded (cache reuse).
+- Export: MP4 (H.264 High profile, yuv420p, +faststart) + AAC. Resolution
+  480/720/1080/2K/4K in wide, vertical, or square; quality presets; smoothness
+  24/30/60 fps; black/white/blurred letterbox background. Encoding runs on the
+  graphics card when one is available (NVIDIA, Apple, Intel Quick Sync, AMD)
+  and falls back to the processor automatically — even mid-export. Progress
+  bar, cancel anytime, segments render in parallel, and unchanged clips are
+  never re-encoded (cache reuse).
 - Slideshow folders (`Name.lantern`) keep copies of your media, so the
   project survives file moves; recent projects are restored on launch.
 

@@ -680,7 +680,8 @@ function Editor({
           <p className="export-done-path">{exportJob.summary.outPath}</p>
           <p className="modal-hint">
             {formatClock(exportJob.summary.totalDuration)} long — easy to share
-            by text, email, or a USB stick.
+            by text, email, or a USB stick. Encoded with{" "}
+            {exportJob.summary.encoder}.
           </p>
           <div className="modal-actions">
             <button
@@ -1299,14 +1300,31 @@ function OptionsSheet({
 }) {
   const settings = snapshot.project.settings;
   const resolutions = [
-    { label: "HD", width: 1280, height: 720 },
-    { label: "Full HD", width: 1920, height: 1080 },
-    { label: "4K", width: 3840, height: 2160 },
+    { label: "480", short: 480 },
+    { label: "720", short: 720 },
+    { label: "1080", short: 1080 },
+    { label: "2K", short: 1440 },
+    { label: "4K", short: 2160 },
+  ];
+  const shapes = [
+    { label: "Wide · TV & computer", value: "wide" as const },
+    { label: "Vertical · phone", value: "vertical" as const },
+    { label: "Square", value: "square" as const },
   ];
   const qualities = [
     { label: "Maximum quality", crf: 18 },
     { label: "High quality", crf: 21 },
     { label: "Good · smaller file", crf: 24 },
+  ];
+  const encoders = [
+    { label: "Automatic (recommended)", value: "auto" as const },
+    { label: "Processor", value: "cpu" as const },
+    { label: "Graphics card", value: "gpu" as const },
+  ];
+  const frameRates = [
+    { label: "Film-like · 24", fps: 24 },
+    { label: "Standard · 30", fps: 30 },
+    { label: "Extra smooth · 60", fps: 60 },
   ];
   const backgrounds = [
     { label: "Blurred photo", value: "blur" as const },
@@ -1314,25 +1332,71 @@ function OptionsSheet({
     { label: "White", value: "white" as const },
   ];
 
+  const currentShape =
+    settings.width > settings.height
+      ? "wide"
+      : settings.height > settings.width
+        ? "vertical"
+        : "square";
+  const currentShort =
+    currentShape === "square"
+      ? settings.width
+      : Math.min(settings.width, settings.height);
+  const pairFor = (shape: string, short: number): [number, number] => {
+    const long = short === 480 ? 854 : (short * 16) / 9;
+    if (shape === "square") return [short, short];
+    if (shape === "vertical") return [short, long];
+    return [long, short];
+  };
+
   return (
     <Modal title="More options" onClose={onClose}>
       <div className="option-group">
-        <h4>Picture size</h4>
+        <h4>Resolution</h4>
         <div className="chip-row">
           {resolutions.map((resolution) => (
             <button
               key={resolution.label}
-              className={`chip ${settings.height === resolution.height ? "active" : ""}`}
+              className={`chip ${
+                (currentShape === "square"
+                  ? settings.width === resolution.short
+                  : currentShort === resolution.short)
+                  ? "active"
+                  : ""
+              }`}
               onClick={() =>
-                apply(() =>
-                  api.settingsSet({
-                    width: resolution.width,
-                    height: resolution.height,
-                  }),
-                )
+                apply(() => {
+                  const [width, height] = pairFor(
+                    currentShape,
+                    resolution.short,
+                  );
+                  return api.settingsSet({ width, height });
+                })
               }
             >
               {resolution.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="option-group">
+        <h4>Shape</h4>
+        <div className="chip-row">
+          {shapes.map((shape) => (
+            <button
+              key={shape.value}
+              className={`chip ${currentShape === shape.value ? "active" : ""}`}
+              onClick={() =>
+                apply(() => {
+                  const [width, height] = pairFor(
+                    shape.value,
+                    Math.min(currentShort, 2160),
+                  );
+                  return api.settingsSet({ width, height });
+                })
+              }
+            >
+              {shape.label}
             </button>
           ))}
         </div>
@@ -1350,6 +1414,42 @@ function OptionsSheet({
             </button>
           ))}
         </div>
+      </div>
+      <div className="option-group">
+        <h4>Smoothness</h4>
+        <div className="chip-row">
+          {frameRates.map((frameRate) => (
+            <button
+              key={frameRate.fps}
+              className={`chip ${settings.fps === frameRate.fps ? "active" : ""}`}
+              onClick={() =>
+                apply(() => api.settingsSet({ fps: frameRate.fps }))
+              }
+            >
+              {frameRate.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="option-group">
+        <h4>Encoding</h4>
+        <div className="chip-row">
+          {encoders.map((encoder) => (
+            <button
+              key={encoder.value}
+              className={`chip ${settings.encoder === encoder.value ? "active" : ""}`}
+              onClick={() =>
+                apply(() => api.settingsSet({ encoder: encoder.value }))
+              }
+            >
+              {encoder.label}
+            </button>
+          ))}
+        </div>
+        <p className="option-hint">
+          Automatic uses your graphics card when it works, and the processor
+          otherwise. Processor encoding always plays everywhere.
+        </p>
       </div>
       <div className="option-group">
         <h4>Empty space around photos</h4>

@@ -848,6 +848,12 @@ button:not(:disabled):active {
   letter-spacing: 0.08em;
 }
 
+.option-hint {
+  margin: 8px 0 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
 /* ---------------------------------------------------------------- preview */
 
 .preview {

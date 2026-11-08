@@ -269,6 +269,16 @@ async fn full_pipeline_produces_playable_mp4() {
     assert!(moov < mdat, "faststart violated: moov at {moov}, mdat at {mdat}");
 
     // Export 2: segments are cached; not a single prepare stage re-runs.
+    let segment_mtimes: Vec<std::time::SystemTime> = std::fs::read_dir(dir.join("Test Show.lantern/cache"))
+        .expect("cache dir")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.file_name().to_string_lossy().ends_with(".ts").then(|| {
+                entry.metadata().ok().and_then(|m| m.modified().ok())
+            })?
+        })
+        .collect();
+    assert_eq!(segment_mtimes.len(), 3, "expected three cached segments");
     ctl.begin().expect("begin 2");
     let out2 = dir.join("out").join("show2.mp4");
     let mut second_events: Vec<(String, usize, usize)> = Vec::new();
@@ -282,9 +292,23 @@ async fn full_pipeline_produces_playable_mp4() {
     .await;
     ctl.end();
     assert!(result2.is_ok(), "re-export failed: {:?}", result2.err());
+    // Reused pieces are credited with a single progress tick; nothing re-encodes.
     assert_eq!(
         second_events.iter().filter(|(phase, ..)| phase == "preparing").count(),
-        0,
+        1,
+        "cached export should emit one reuse tick"
+    );
+    let segment_mtimes_after: Vec<std::time::SystemTime> = std::fs::read_dir(dir.join("Test Show.lantern/cache"))
+        .expect("cache dir")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.file_name().to_string_lossy().ends_with(".ts").then(|| {
+                entry.metadata().ok().and_then(|m| m.modified().ok())
+            })?
+        })
+        .collect();
+    assert_eq!(
+        segment_mtimes, segment_mtimes_after,
         "cached segments must not be re-encoded"
     );
     assert!(out2.exists());

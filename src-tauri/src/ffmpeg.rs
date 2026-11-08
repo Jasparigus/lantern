@@ -11,6 +11,119 @@ pub struct Binaries {
     pub ffprobe: PathBuf,
 }
 
+/// Video encoder backend. Selected from the user's preference plus a runtime
+/// probe (some GPUs/drivers expose an encoder that then fails at init, e.g.
+/// broken NVIDIA driver sessions — the probe catches that and falls back).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Encoder {
+    Libx264,
+    Nvenc,
+    Amf,
+    VideoToolbox,
+    Qsv,
+    Vaapi,
+}
+
+impl Encoder {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Encoder::Libx264 => "libx264",
+            Encoder::Nvenc => "h264_nvenc",
+            Encoder::Amf => "h264_amf",
+            Encoder::VideoToolbox => "h264_videotoolbox",
+            Encoder::Qsv => "h264_qsv",
+            Encoder::Vaapi => "h264_vaapi",
+        }
+    }
+
+    /// Short label for logs and the export summary.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Encoder::Libx264 => "processor",
+            Encoder::Nvenc => "graphics card (NVIDIA)",
+            Encoder::Amf => "graphics card (AMD)",
+            Encoder::VideoToolbox => "graphics card (Apple)",
+            Encoder::Qsv => "graphics card (Intel Quick Sync)",
+            Encoder::Vaapi => "graphics card",
+        }
+    }
+
+    /// Encoders that need frames uploaded to GPU memory via the filter graph.
+    pub fn needs_hwupload(&self) -> bool {
+        matches!(self, Encoder::Qsv | Encoder::Vaapi)
+    }
+}
+
+/// Runs a ~0.2 s black-frame encode with the same encoder flags the real
+/// export uses, so a probe that passes guarantees the stage flags parse.
+fn encoder_works(bins: &Binaries, encoder: Encoder) -> bool {
+    let quality_flags: &[&str] = match encoder {
+        Encoder::Libx264 => &["-preset", "medium", "-crf", "21"],
+        Encoder::Nvenc => &["-preset", "p5", "-rc", "constqp", "-cq", "21"],
+        Encoder::Amf => &["-quality", "balanced", "-rc", "cqp", "-qp_i", "21", "-qp_p", "21"],
+        Encoder::VideoToolbox => &["-q:v", "60"],
+        Encoder::Qsv => &["-rc", "cqp", "-global_quality", "21"],
+        Encoder::Vaapi => &["-rc", "cqp", "-global_quality", "21"],
+    };
+    let mut command = std::process::Command::new(&bins.ffmpeg);
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        // Production-scale probe: tiny probes can pass while real 1080p GPU
+        // contexts fail (driver session/VRAM limits), which is exactly the
+        // failure this probe exists to catch.
+        "color=black:s=1920x1080:r=30:d=0.5",
+    ]);
+    command.arg("-c:v").arg(encoder.name());
+    command.args(quality_flags);
+    if encoder.needs_hwupload() {
+        // Same upload path the real export uses (the default hardware device
+        // is opened automatically).
+        command.args(["-vf", "format=nv12,hwupload"]);
+    } else {
+        command.args(["-pix_fmt", "yuv420p"]);
+    }
+    command.args(["-f", "null", "-"]);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Which GPU encoder (if any) this machine can actually use. Probed once per
+/// process, best-known candidates first (NVIDIA, Apple, Intel QSV, AMD, VAAPI).
+fn gpu_encoder(bins: &Binaries) -> Option<Encoder> {
+    static CACHE: std::sync::OnceLock<Option<Encoder>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        [
+            Encoder::Nvenc,
+            Encoder::VideoToolbox,
+            Encoder::Qsv,
+            Encoder::Amf,
+            Encoder::Vaapi,
+        ]
+        .into_iter()
+        .find(|encoder| encoder_works(bins, *encoder))
+    })
+}
+
+/// Map the persisted `"auto" | "cpu" | "gpu"` preference to a working encoder.
+/// `"gpu"` still falls back to CPU when the GPU encoder is broken or absent —
+/// an export must never fail just because a preference was optimistic.
+pub fn resolve_encoder(bins: &Binaries, preference: &str) -> Encoder {
+    match preference {
+        "auto" | "gpu" => gpu_encoder(bins).unwrap_or(Encoder::Libx264),
+        _ => Encoder::Libx264,
+    }
+}
+
 impl Binaries {
     pub fn resolve(resource_dir: Option<&Path>) -> Binaries {
         Binaries {
@@ -103,12 +216,14 @@ pub async fn run_version(ffmpeg: &Path) -> Result<String, String> {
 
 /// Everything the segment encoder needs: frame spec from project settings plus the
 /// per-item choices. Kept separate from project types so command builders stay pure.
+#[derive(Clone)]
 pub struct EncodeSpec {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub crf: u32,
     pub preset: String,
+    pub encoder: Encoder,
     pub fit: Fit,
     pub background: Background,
 }
@@ -136,7 +251,12 @@ fn background_color(background: Background) -> &'static str {
 /// Normalizing tail every segment shares: even SAR (phone video SAR varies and
 /// breaks concat), constant frame rate, yuv420p.
 fn tail(spec: &EncodeSpec) -> String {
-    format!(",setsar=1,fps={},format=yuv420p", spec.fps)
+    let upload = if spec.encoder.needs_hwupload() {
+        ",format=nv12,hwupload"
+    } else {
+        ",format=yuv420p"
+    };
+    format!(",setsar=1,fps={}{}", spec.fps, upload)
 }
 
 pub fn segment_filter(spec: &EncodeSpec) -> FilterPlan {
@@ -152,11 +272,16 @@ pub fn segment_filter(spec: &EncodeSpec) -> FilterPlan {
                 "[0:v]split=2[fg][bg];",
                 "[bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},gblur=sigma=20[bgb];",
                 "[fg]scale={w}:{h}:force_original_aspect_ratio=decrease[fgs];",
-                "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={fps},format=yuv420p[vout]"
+                "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={fps}{upload}[vout]"
             ),
             w = w,
             h = h,
-            fps = spec.fps
+            fps = spec.fps,
+            upload = if spec.encoder.needs_hwupload() {
+                ",format=nv12,hwupload"
+            } else {
+                ",format=yuv420p"
+            }
         )),
         (Fit::Contain, background) => FilterPlan::Simple(format!(
             concat!(
@@ -171,6 +296,7 @@ pub fn segment_filter(spec: &EncodeSpec) -> FilterPlan {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum SegmentKind {
     Image,
     Video { trim_start: f64 },
@@ -224,19 +350,78 @@ pub fn segment_command(
             ]);
         }
     }
-    args.extend([
-        String::from("-r"),
-        spec.fps.to_string(),
-        String::from("-c:v"),
-        String::from("libx264"),
-        String::from("-preset"),
-        spec.preset.clone(),
-        String::from("-crf"),
-        spec.crf.to_string(),
-        String::from("-pix_fmt"),
-        String::from("yuv420p"),
+    args.extend([String::from("-r"), spec.fps.to_string()]);
+    match spec.encoder {
+        Encoder::Libx264 => args.extend([
+            String::from("-c:v"),
+            String::from("libx264"),
+            String::from("-preset"),
+            spec.preset.clone(),
+            String::from("-crf"),
+            spec.crf.to_string(),
+        ]),
+        Encoder::Nvenc => args.extend([
+            String::from("-c:v"),
+            String::from("h264_nvenc"),
+            String::from("-preset"),
+            String::from(match spec.crf {
+                0..=18 => "p6",
+                19..=23 => "p5",
+                _ => "p4",
+            }),
+            String::from("-rc"),
+            String::from("constqp"),
+            String::from("-cq"),
+            spec.crf.to_string(),
+        ]),
+        Encoder::Amf => args.extend([
+            String::from("-c:v"),
+            String::from("h264_amf"),
+            String::from("-quality"),
+            String::from(match spec.crf {
+                0..=18 => "quality",
+                19..=23 => "balanced",
+                _ => "speed",
+            }),
+            String::from("-rc"),
+            String::from("cqp"),
+            String::from("-qp_i"),
+            spec.crf.to_string(),
+            String::from("-qp_p"),
+            spec.crf.to_string(),
+        ]),
+        Encoder::VideoToolbox => args.extend([
+            String::from("-c:v"),
+            String::from("h264_videotoolbox"),
+            // VideoToolbox takes a 1-99 quality dial instead of CRF.
+            String::from("-q:v"),
+            ((51 - spec.crf) * 2).clamp(1, 99).to_string(),
+        ]),
+        Encoder::Qsv => args.extend([
+            String::from("-c:v"),
+            String::from("h264_qsv"),
+            String::from("-rc"),
+            String::from("cqp"),
+            String::from("-global_quality"),
+            spec.crf.to_string(),
+        ]),
+        Encoder::Vaapi => args.extend([
+            String::from("-c:v"),
+            String::from("h264_vaapi"),
+            String::from("-rc"),
+            String::from("cqp"),
+            String::from("-global_quality"),
+            spec.crf.to_string(),
+        ]),
+    }
+    if !spec.encoder.needs_hwupload() {
         // JPEG photos decode as full-range (yuvj420p); TVs and most players
-        // expect standard limited range, so every segment is forced to tv range.
+        // expect standard limited range, so every segment is forced to tv
+        // range on the yuv420p path. QSV/VAAPI consume nv12 hardware frames
+        // from hwupload, where forcing yuv420p would conflict.
+        args.extend([String::from("-pix_fmt"), String::from("yuv420p")]);
+    }
+    args.extend([
         String::from("-color_range"),
         String::from("tv"),
         String::from("-an"),
@@ -394,9 +579,71 @@ mod tests {
             fps: 30,
             crf: 21,
             preset: "medium".to_string(),
+            encoder: Encoder::Libx264,
             fit: Fit::Contain,
             background: Background::Black,
         }
+    }
+
+    #[test]
+    fn gpu_encoders_get_encoder_specific_flags() {
+        let media = Path::new("photo.jpg");
+        let out = Path::new("out.ts");
+
+        let nvenc = {
+            let mut s = spec();
+            s.encoder = Encoder::Nvenc;
+            segment_command(media, out, &s, SegmentKind::Image, 3.0).join(" ")
+        };
+        assert!(nvenc.contains("-c:v h264_nvenc -preset p5 -rc constqp -cq 21"));
+        assert!(nvenc.contains("-pix_fmt yuv420p"));
+        assert!(!nvenc.contains("libx264"));
+
+        let amf = {
+            let mut s = spec();
+            s.encoder = Encoder::Amf;
+            s.crf = 24;
+            segment_command(media, out, &s, SegmentKind::Image, 3.0).join(" ")
+        };
+        assert!(amf.contains("-c:v h264_amf -quality speed -rc cqp -qp_i 24 -qp_p 24"));
+
+        let toolbox = {
+            let mut s = spec();
+            s.encoder = Encoder::VideoToolbox;
+            segment_command(media, out, &s, SegmentKind::Image, 3.0).join(" ")
+        };
+        assert!(toolbox.contains("-c:v h264_videotoolbox -q:v 60"));
+
+        // Quick Sync and VAAPI consume uploaded hardware frames instead of
+        // plain yuv420p.
+        let qsv = {
+            let mut s = spec();
+            s.encoder = Encoder::Qsv;
+            segment_command(media, out, &s, SegmentKind::Image, 3.0).join(" ")
+        };
+        assert!(qsv.contains("fps=30,format=nv12,hwupload"));
+        assert!(qsv.contains("-c:v h264_qsv -rc cqp -global_quality 21"));
+        assert!(!qsv.contains("-pix_fmt"));
+
+        let vaapi = {
+            let mut s = spec();
+            s.encoder = Encoder::Vaapi;
+            s.fit = Fit::Cover;
+            segment_command(media, out, &s, SegmentKind::Image, 3.0).join(" ")
+        };
+        assert!(vaapi.contains("crop=1920:1080,setsar=1,fps=30,format=nv12,hwupload"));
+        assert!(vaapi.contains("-c:v h264_vaapi -rc cqp -global_quality 21"));
+    }
+
+    #[test]
+    fn gpu_preference_falls_back_when_encoder_unavailable() {
+        let bins = Binaries {
+            ffmpeg: PathBuf::from("/nonexistent/ffmpeg"),
+            ffprobe: PathBuf::from("/nonexistent/ffprobe"),
+        };
+        assert_eq!(resolve_encoder(&bins, "gpu"), Encoder::Libx264);
+        assert_eq!(resolve_encoder(&bins, "auto"), Encoder::Libx264);
+        assert_eq!(resolve_encoder(&bins, "cpu"), Encoder::Libx264);
     }
 
     #[test]
