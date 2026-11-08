@@ -667,10 +667,6 @@ function Editor({
                 Cancel
               </button>
             </div>
-            <p className="export-note">
-              Keep this window open — you can keep working on the slideshow
-              while it renders.
-            </p>
           </div>
         </div>
       )}

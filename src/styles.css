@@ -818,12 +818,6 @@ button:not(:disabled):active {
   font-variant-numeric: tabular-nums;
 }
 
-.export-note {
-  color: var(--muted);
-  font-size: 0.85rem;
-  margin: 12px 0 0;
-}
-
 .export-done-path {
   background: var(--bg-deep);
   border: 1px solid var(--border);
